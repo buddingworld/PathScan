@@ -171,7 +171,11 @@ class Worker(threading.Thread):
         return task.from_ == "backup" and task.name.startswith("__probe__")
 
     def live(self, task, url, ok):
-        """打一条实时日志（带速度与备注）。只输出到屏幕，不写 --of。"""
+        """打一条实时日志（带速度与备注）。只输出到屏幕，不写 --of。
+
+        remark 的显示门控在 Printer.live_line 里（只在 ok 时显示），
+        这里照常把备注传进去即可。
+        """
         self.engine.printer.live_line(self.thread_id, task.path, ok,
                                       self.engine.state.speed(),
                                       self.engine.remark_for(task))

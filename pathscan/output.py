@@ -153,7 +153,10 @@ class Printer(object):
 
         实时日志只走屏幕，从不写进 --of 的文件（导出走 format_report）。
         路径不足 LIVE_PATH_WIDTH 时补空格对齐；超长则原样输出（此时会牺牲
-        对齐，但信息完整优先）。备注非空时追加在行尾。
+        对齐，但信息完整优先）。
+
+        备注只在 ok（请求非 404，含未被规则视为 404）时显示——
+        与备注的值本身无关，所以这里的门控不放给调用方。
         """
         # 先按「纯前缀 + 路径」拼，路径对齐到固定宽度
         head = "ThreadID:%d  ->  " % thread_id
@@ -161,7 +164,7 @@ class Printer(object):
         text = "%s%s [%s]" % (head, body, status_marker(ok))
         if speed is not None:
             text += "  Speed: %.1f/s" % speed
-        if remark:
+        if ok and remark:
             text += "  #%s" % remark
         with self.lock:
             if not self.live_enabled:
@@ -232,7 +235,12 @@ def format_line(rec):
     return line
 
 
-def _section(lines, title, entries):
+def _section(lines, title, entries, show_remark=False):
+    """渲染报告里的一个小节。
+
+    show_remark 只在「非 404」的小节（Result(OK)）为 True——
+    备注的显示取决于请求结果是否为 404，与备注的值无关。
+    """
     lines.append("%s:" % title)
     if not entries:
         lines.append("    (none)")
@@ -241,7 +249,7 @@ def _section(lines, title, entries):
     width = max(len(p) for p in paths)
     for path, entry in zip(paths, entries):
         line = "    %s  %s" % (path.ljust(width), _code_bits(entry))
-        if entry.get("remark"):
+        if show_remark and entry.get("remark"):
             line += "  #%s" % entry["remark"]
         lines.append(line)
 
@@ -257,17 +265,20 @@ def format_report(state, args):
              /xx1  [200] (99)
         Result(OK):
             /xx2  [200] (1234)
+
+    Ignored Paths 里的条目本身就是被判为 404 的，所以不显示备注；
+    备注只出现在 Result(OK) 里。
     """
     lines = []
     lines.append(args.url + "/")
     _section(lines, "Ignored Paths", state.ignored)
-    _section(lines, "Result(OK)", state.results)
+    _section(lines, "Result(OK)", state.results, show_remark=True)
     if state.errors:
         lines.append("")
         _section(lines, "Errors", [
             {"path": e["path"], "code": None, "size": None,
              "remark": "tries=%d %s" % (e["trytimes"], e.get("reason", ""))}
-            for e in state.errors])
+            for e in state.errors], show_remark=True)
     return lines
 
 

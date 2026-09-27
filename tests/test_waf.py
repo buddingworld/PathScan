@@ -560,7 +560,7 @@ def test_depth_allowed_semantics():
 
 
 def test_remark_field_parsing():
-    """备注 JSON：remark 显示，"404" 不显示；与 waf/r 共存。"""
+    """备注 JSON：remark 原样保留（值本身无特殊含义）；与 waf/r 共存。"""
     import tempfile
 
     tmp = tempfile.mkdtemp()
@@ -577,8 +577,9 @@ def test_remark_field_parsing():
 
     print("  tagged remark=%r" % by["tagged"]["remark"])
     assert by["tagged"]["remark"] == "ZhiyuanOA"
-    print("  as404  remark=%r (应为空)" % by["as404"]["remark"])
-    assert by["as404"]["remark"] == "", 'remark="404" 不应显示'
+    # remark 的值就是普通文本，"404" 没有特殊含义
+    print("  as404  remark=%r (原样保留)" % by["as404"]["remark"])
+    assert by["as404"]["remark"] == "404", "remark 值应原样保留"
     m = by["mix"]
     print("  mix    remark=%r waf=%s r=(%s,%s)"
           % (m["remark"], m["waf"], m["depth_lo"], m["depth_hi"]))
@@ -589,41 +590,53 @@ def test_remark_field_parsing():
     print("  test_remark_field_parsing OK")
 
 
-def test_remark_in_live_and_report():
-    """非 "404" 的备注在实时日志与最终输出尾部显示。"""
+def test_remark_shown_only_on_non_404():
+    """备注只在请求非 404 时显示（与备注的值无关）。"""
     import io as _io
 
     class FakeTTY(_io.StringIO):
         def isatty(self):
             return True
 
+    # 命中（非 404）-> 显示备注
     buf = FakeTTY()
     pr = output.Printer(live=True, stream=buf)
     pr.live_line(0, "admin", True, speed=1.0, remark="ZhiyuanOA")
     pr.finish_live()
     text = buf.getvalue()
-    print("  实时行:", text.strip())
+    print("  [ok ] 行:", text.strip())
     assert "#ZhiyuanOA" in text, text
-    assert "[ok ]" in text, "ok 标记应补空格: %r" % text
 
-    # 备注为空时不出现多余的 #
+    # 404（ok=False）-> 不显示备注
     buf2 = FakeTTY()
     pr2 = output.Printer(live=True, stream=buf2)
-    pr2.live_line(0, "admin", True, speed=1.0, remark="")
+    pr2.live_line(0, "admin", False, speed=1.0, remark="ZhiyuanOA")
     pr2.finish_live()
-    assert "#" not in buf2.getvalue(), buf2.getvalue()
+    print("  [err] 行:", buf2.getvalue().strip())
+    assert "ZhiyuanOA" not in buf2.getvalue(), buf2.getvalue()
 
-    # 最终报告
+    # 备注为空时也不出现多余的 #
+    buf3 = FakeTTY()
+    pr3 = output.Printer(live=True, stream=buf3)
+    pr3.live_line(0, "admin", True, speed=1.0, remark="")
+    pr3.finish_live()
+    assert "#" not in buf3.getvalue(), buf3.getvalue()
+
+    # 最终报告：备注只在 Result(OK)，不在 Ignored Paths
     st = GlobalState(mk_args())
     st.add_result({"path": "admin", "url": "http://t/admin", "type": "dir",
                    "code": 200, "size": 10, "location": None,
                    "from": "common", "remark": "ZhiyuanOA", "depth": 1})
+    st.add_ignored(mk_task("ignored1"), "http://t/ignored1", 301, 0,
+                   "/x", "--ir test")
+    st.ignored[-1]["remark"] = "不该出现"
     report = "\n".join(output.format_report(st, mk_args()))
     print("  --- 报告 ---")
     for line in report.splitlines():
         print("   |", line)
     assert "#ZhiyuanOA" in report, report
-    print("  test_remark_in_live_and_report OK")
+    assert "不该出现" not in report, "Ignored Paths 不应显示备注"
+    print("  test_remark_shown_only_on_non_404 OK")
 
 
 def test_error_shows_demos():
@@ -640,7 +653,7 @@ def test_error_shows_demos():
 
     # --help 的 epilog 里也要有
     helptext = cli.build_parser().format_help()
-    assert "常用命令示例" in helptext, helptext[-400:]
+    assert "Common Commands" in helptext, helptext[-400:]
     assert "Common IIS" in helptext
     print("  --help 含示例: OK")
 
@@ -681,7 +694,7 @@ def main():
         ("r 层级解析", test_depth_range_parse),
         ("r 层级语义", test_depth_allowed_semantics),
         ("remark 字段解析", test_remark_field_parsing),
-        ("remark 显示位置", test_remark_in_live_and_report),
+        ("remark 仅非404显示", test_remark_shown_only_on_non_404),
         ("示例提示", test_error_shows_demos),
     ]
     failed = []

@@ -25,7 +25,7 @@ python pathscan.py --help
 参数缺失或出错时也会附带常用命令示例：
 
 ```
-常用命令示例
+Common Commands:
   Common IIS: pathscan.py -d d.txt -f f.txt -s .aspx --cs 0
   Common JSP: pathscan.py -d d.txt -f f.txt -s .jsp --cs 1
   Common PHP: pathscan.py -d d.txt -f f.txt -s .php --cs 1
@@ -100,7 +100,7 @@ tagged#{"remark":"ZhiyuanOA"}
 |---|---|
 | `waf` | 该名称易被 WAF 拦截的阈值。同一名称的失败次数超过该值后全局不再扫描。默认 `0` = 不检测 |
 | `r` | **仅在这些层级测试**。`"0-1"` 表示 0~1 层，`"2"` 表示只测第 2 层，`"1-"` 表示 1 层及以上。层数按目录算：`/test` 是 1 层，`/xx/test` 是 2 层 |
-| `remark` | 备注文本，**非 `"404"` 时**会追加显示在实时日志与最终输出行尾；值为 `"404"` 表示该条本身即 404，不显示 |
+| `remark` | 备注文本。**仅在该路径请求结果非 404**（含未被规则视为 404）时，追加显示在实时日志与最终输出行尾。与备注的值无关 |
 
 `r` 字段的例子：
 
@@ -108,6 +108,19 @@ tagged#{"remark":"ZhiyuanOA"}
 test#{"r":"0-1"}      # /test 会测，/admin/test 不会
 deep#{"r":"2-"}       # 只在第 2 层及更深测
 mix#{"remark":"后台","waf":3,"r":"0-2"}
+```
+
+`remark` 的显示例子：
+
+```
+admin#{"remark":"后台管理"}   # 返回 200 -> 显示
+Ignored Paths: 里的条目不显示    # 被判为 404 的路径
+```
+
+实时日志：
+
+```
+ThreadID:1  ->  /admin    [ok ]  Speed: 0.9/s  #后台管理
 ```
 
 ## 探测机制

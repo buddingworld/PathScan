@@ -39,7 +39,7 @@ DEMOS = [
 def format_demos():
     """把 DEMOS 排成对齐的一段文本。"""
     width = max(len(label) for label, _ in DEMOS)
-    lines = ["常用命令示例"]
+    lines = ["Common Commands:"]
     for label, cmd in DEMOS:
         lines.append("  %s: %s" % (label.ljust(width), cmd))
     return "\n".join(lines)
@@ -378,8 +378,8 @@ def load_wordlist(path, kind):
 
     * ``waf``    —— 该名称易被 WAF 拦截的阈值（默认 0 = 不检测）
     * ``r``      —— 仅在这些层级测试，如 ``"0-1"``、``"2"``、``"1-"``
-    * ``remark`` —— 备注文本，**非 "404" 时**会在实时日志与最终输出里追加显示；
-                   值是 ``"404"`` 表示这条本身就被视为 404，不显示
+    * ``remark`` —— 备注文本。仅在该路径**请求结果非 404**（未被规则视为 404）
+                   时，追加显示在实时日志与最终输出的行尾
 
     返回 (entries, bad_lines)，entry 为 dict:
         {"name","remark","waf","depth_lo","depth_hi"}
@@ -415,10 +415,10 @@ def load_wordlist(path, kind):
                             waf = int(obj.get("waf", 0) or 0)
                         except (TypeError, ValueError):
                             waf = 0
-                        # remark 字段：值为 "404" 时视为该条即 404，不显示备注
-                        text = obj.get("remark", "")
-                        text = "" if text is None else str(text)
-                        remark = "" if text == "404" else text
+                        # remark：原样保留，是否显示由「请求是否非 404」决定，
+                        # 与 remark 的值本身无关
+                        remark = obj.get("remark", "")
+                        remark = "" if remark is None else str(remark)
                         if "r" in obj:
                             try:
                                 depth_lo, depth_hi = parse_depth_range(obj["r"])
