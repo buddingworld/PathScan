@@ -215,10 +215,18 @@ class Printer(object):
 
 
 def _code_bits(rec):
-    """``[200] (1234)`` 或 ``[302] (0) -> /xx1``。"""
+    """``[200] (1234)`` 或 ``[302] (0) -> /xx1``。
+
+    ``code`` 为 None 时：``from == "okdir"`` 是 --od 预置的目录，标 ``[od]``；
+    其余（重试超限）标 ``[ERR]``。
+    """
     code = rec.get("code")
-    head = "[ERR]" if code is None else "[%d]" % code
-    out = "%s (%s)" % (head, human_size(rec.get("size")))
+    if code is None:
+        head = "[od]" if rec.get("from") == "okdir" else "[ERR]"
+    else:
+        head = "[%d]" % code
+    size = human_size(rec.get("size"))
+    out = "%s (%s)" % (head, size)
     loc = rec.get("location")
     if loc:
         out += " -> %s" % loc

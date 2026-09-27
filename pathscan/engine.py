@@ -388,6 +388,9 @@ class Engine(object):
         # 根目录：dircheck + 后缀探测 + 备份探针 + 备份任务
         self.open_dir("", is_root=True)
 
+        # --od 指定的目录：逐层视为已存在，不走探测，并且参与递归
+        self.open_ok_dirs()
+
         with state.lock:
             self.printer.info("队列已就绪，启动 %d 个线程..." % args.thread)
         for i in range(args.thread):
@@ -395,12 +398,42 @@ class Engine(object):
             self.workers.append(w)
             w.start()
 
-    def open_dir(self, dirpath, is_root=False):
+    def open_ok_dirs(self):
+        """登记 --od 指定的目录。
+
+        由浅到深逐层打开：--od dir1/dir2/dir3/ 会依次打开 dir1、
+        dir1/dir2、dir1/dir2/dir3，每一层都直接判定为存在并参与递归，
+        这样不会因为中间层没出现在词表里而断链。
+
+        每层都会登记一条结果（--od 意味着「已确认存在」），但不会发请求。
+        """
+        args = self.args
+        for path in args.ok_dirs:
+            self.open_dir(path, assume_ok=True)
+            url = build_url(args.url, path, "dir", args.mode)
+            rec = {
+                "path": path,
+                "url": url,
+                "type": "dir",
+                "code": None,
+                "size": None,
+                "location": None,
+                "from": "okdir",
+                "remark": "",
+                "depth": path_depth(path),
+            }
+            if self.state.add_result(rec):
+                self.printer.raw("[od]     %s  (--od 已确认存在)" % url)
+
+    def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。
 
         探测包括三种：dircheck（是否软 404）、后缀检测（每个 -s 后缀各一次）、
         备份探针（随机备份名）。常规任务全部暂存在延迟组里，等探测结算——
         否则备份的上千个任务会在后缀结论出来之前就被扫掉。
+
+        assume_ok 为 True 时（--od 指定的目录）跳过所有探测，直接按
+        「目录存在、后缀全部可用」结算并立刻放行任务。
 
         每个目录只登记一次（state.claim_dir 保证）。
         """
@@ -420,6 +453,14 @@ class Engine(object):
                                       self.remark_for(
                                           Task("dir", "", dirpath))))
         state.put_group(dirpath, "backup", backup)
+
+        # --od：已知存在，不走探测，直接按「存在 + 后缀全可用」结算放行
+        if assume_ok:
+            state.register_probes(dirpath, 1)
+            state.note_verdict(dirpath, "dead", value=False)
+            self.debug("--od 直接放行目录 %r（常规 %d / 备份 %d）"
+                       % (dirpath, len(common), len(backup)))
+            return
 
         # 3) 探测任务本身：直接入队
         probe_tasks = [probes.make_dircheck_task(dirpath)]

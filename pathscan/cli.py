@@ -240,6 +240,11 @@ def build_parser():
     g = p.add_argument_group("输出")
     g.add_argument("--of", "--output-file", dest="of", metavar="FILE",
                    help="结果导出路径")
+    g.add_argument("--od", "--ok-dirs", dest="od", action="append",
+                   metavar="PATH",
+                   help="已确认存在的目录，形如 dir1/dir2/dir3/。每一层都会"
+                        "被直接判定为存在（不经过探测），并与其他目录一起"
+                        "参与递归。可多次")
     g.add_argument("--cq", "--quiet", dest="quiet", action="store_true",
                    help="安静模式：不输出实时日志，只保留最终报告")
 
@@ -281,6 +286,8 @@ class Args(object):
         self.ka = self.ka
         self.keep_alive = self.ka >= 0
         self.ka_limit = 0 if self.ka == 0 else self.ka
+        # --od：逐层展开的「已确认存在」目录
+        self.ok_dirs = parse_ok_dirs(self.od)
         # --ed / --ef 的掩码在这里就展开，保证 Args 构造完即可用；
         # 出错时留给 validate() 统一汇报，不在这里抛。
         self.mask_error = None
@@ -299,6 +306,40 @@ class Args(object):
             return []
         # 空串是隐含的，这里只保留显式给出的连接符
         return [c for c in maskmod.split_top_level(self.csc) if c != ""]
+
+
+def parse_ok_dirs(values):
+    """解析 --od：``dir1/dir2/dir3/`` -> 逐层的所有前缀。
+
+    返回按深度由浅到深、去重后的路径列表：
+
+        ["dir1", "dir1/dir2", "dir1/dir2/dir3"]
+
+    这样每一层都会被视为已确认存在的目录，既能直接登记为结果，
+    也能作为递归的起点（避免因为中间某一层没在词表里而断链）。
+
+    支持多次传入，单次内也支持逗号分隔（与 -s / --ed 等参数一致）。
+    """
+    out = []
+    seen = set()
+    specs = []
+    for raw in values or []:
+        if raw is None:
+            continue
+        # 逗号分隔，但路径里正常不会出现逗号
+        specs.extend(p for p in str(raw).split(",") if p.strip())
+    for spec in specs:
+        # 允许 dir1/dir2/dir3/ 也允许 dir1/dir2/dir3
+        text = spec.strip().strip("/")
+        if not text:
+            continue
+        parts = [p for p in text.split("/") if p]
+        for i in range(1, len(parts) + 1):
+            path = "/".join(parts[:i])
+            if path not in seen:
+                seen.add(path)
+                out.append(path)
+    return out
 
 
 def normalize_url(url):

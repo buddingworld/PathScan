@@ -193,6 +193,7 @@ ThreadID:1  ->  /admin    [ok ]  Speed: 0.9/s  #后台管理
 | `--mode` | 2 | 1=目录补 `/`，2=不补 |
 | `--cs` | 1 | 大小写敏感开关 |
 | `--ti` | 0 | 线程内请求间隔，如 `1`、`0.2`、`1-3`（区间随机） |
+| `--od` | — | 已确认存在的目录，形如 `dir1/dir2/dir3/`。逐层直接判定为存在（不探测）并参与递归。可多次 |
 | `--of` | — | 结果导出路径 |
 | `--ir` | — | 忽略规则，2 参数可多次：`--ir <属性> <值>` |
 | `--br` | — | 排除路径规则，2 参数可多次：`--br <属性> <值>` |
@@ -226,6 +227,31 @@ python pathscan.py -u http://t -d d.txt -f f.txt --ir size 1234
 # 路径里含 logout 的一律不扫
 python pathscan.py -u http://t -d d.txt -f f.txt --br name logout
 ```
+
+## 已知存在的目录（--od）
+
+`--od dir1/dir2/dir3/` 会把路径的**每一层**都直接判定为存在，不经过探测：
+
+```
+--od admin/backend/
+  等价于认定 admin/ 、admin/backend/ 都存在
+```
+
+这些目录会：
+
+* 直接登记为结果（报告里标 `[od]`，无状态码）；
+* 参与递归 —— 其下的子目录/文件按正常流程扫描；
+* 跳过 dircheck / 后缀检测 / 备份探测，因此不产生探测请求。
+
+逐层登记的意义在于补齐中间层：如果词表里没有 `admin`，只写
+`--od admin/backend/` 也能让扫描从 `admin/backend/` 往下正常展开，不会断链。
+
+```bash
+# 已知后台在这两个路径下，直接跳过探测从这些目录开始铺开
+python pathscan.py -u http://t -d d.txt -f f.txt   --od admin/backend/ --od manage/console/
+```
+
+也可以逗号分隔：`--od admin/backend/,manage/`。
 
 ## 掩码
 

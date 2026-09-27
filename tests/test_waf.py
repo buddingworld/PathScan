@@ -670,6 +670,101 @@ def test_error_shows_demos():
     print("  test_error_shows_demos OK")
 
 
+def test_ok_dirs_parsing():
+    """--od 逐层展开，支持多次传入与逗号分隔，去重保序。"""
+    assert cli.parse_ok_dirs(["dir1/dir2/dir3/"]) == [
+        "dir1", "dir1/dir2", "dir1/dir2/dir3"]
+    assert cli.parse_ok_dirs(["dir1/dir2/dir3"]) == [
+        "dir1", "dir1/dir2", "dir1/dir2/dir3"]
+    assert cli.parse_ok_dirs(["admin"]) == ["admin"]
+    # 逗号分隔 + 多次传入
+    assert cli.parse_ok_dirs(["a/b,c"]) == ["a", "a/b", "c"]
+    assert cli.parse_ok_dirs(["x/y", "z"]) == ["x", "x/y", "z"]
+    # 去重且保持由浅到深
+    assert cli.parse_ok_dirs(["a/b,a/b/c", "a"]) == ["a", "a/b", "a/b/c"]
+    # 首尾斜杠与空值
+    assert cli.parse_ok_dirs(["/a/"]) == ["a"]
+    assert cli.parse_ok_dirs([]) == []
+    assert cli.parse_ok_dirs([None, "", "  "]) == []
+    print("  dir1/dir2/dir3/ -> %s" % cli.parse_ok_dirs(["dir1/dir2/dir3/"]))
+    print("  test_ok_dirs_parsing OK")
+
+
+def test_ok_dirs_skips_probe_and_recurses():
+    """--od 目录不探测、直接登记结果，并参与递归。"""
+    counter = []
+    existing = {
+        "/admin": (200, b"admin"),
+        "/admin/backend": (200, b"backend"),
+        "/admin/backend/users": (200, b"users"),
+    }
+    srv, url = start_server(make_handler(existing, counter=counter))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "od_d.txt")
+    f = os.path.join(tmp, "od_f.txt")
+    with open(d, "w") as fh:
+        fh.write("users\n")          # 词表里只有 users
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "4", "-r", "3", "--timeout", "5",
+         "--od", "admin/backend/"]))
+    print("  ok_dirs: %s" % args.ok_dirs)
+    assert args.ok_dirs == ["admin", "admin/backend"]
+
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    try:
+        eng.start()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            with st.lock:
+                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                    break
+            time.sleep(0.05)
+    finally:
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    by = {r["path"]: r for r in st.results}
+    print("  结果: %s" % sorted(by))
+    by = {r["path"]: r for r in st.results}
+    # 两层都被登记为结果，from=okdir、code 为 None
+    assert by["admin"]["from"] == "okdir", by.get("admin")
+    assert by["admin/backend"]["from"] == "okdir", by.get("admin/backend")
+    assert by["admin"]["code"] is None and by["admin/backend"]["code"] is None
+    # 递归走到了第 3 层
+    assert "admin/backend/users" in by, sorted(by)
+    assert by["admin/backend/users"]["from"] == "common"
+    print("  递归找到 admin/backend/users: OK")
+
+    # --od 目录不该出现 dircheck 探测请求（随机名.随机后缀）
+    import re
+    od_probes = [p for p in counter
+                 if re.match(r"^/(admin|admin/backend)/[a-z0-9]{8}\.[a-z0-9]{5}$", p)]
+    print("  --od 目录的 dircheck 请求数: %d (应为 0)" % len(od_probes))
+    assert not od_probes, od_probes
+
+    # 报告里 --od 项标 [od]
+    report = "\n".join(output.format_report(st, args))
+    print("  --- 报告 ---")
+    for line in report.splitlines():
+        print("   |", line)
+    assert "[od]" in report, report
+    print("  test_ok_dirs_skips_probe_and_recurses OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -696,6 +791,8 @@ def main():
         ("remark 字段解析", test_remark_field_parsing),
         ("remark 仅非404显示", test_remark_shown_only_on_non_404),
         ("示例提示", test_error_shows_demos),
+        ("--od 解析", test_ok_dirs_parsing),
+        ("--od 跳过探测并递归", test_ok_dirs_skips_probe_and_recurses),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):
