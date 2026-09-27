@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+tests/_tmp/
+*.log
+
+# Claude Code 本地权限配置（含本机路径，不入库）
+.claude/settings.local.json
