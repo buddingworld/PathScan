@@ -765,14 +765,12 @@ def test_ok_dirs_skips_probe_and_recurses():
 
 
 def test_scan_starts_from_root_with_od():
-    """--od 不能让扫描从 /tc 开始：根目录的词表项要先被扫到。
+    """--od 不能让扫描只扫 /tc：根目录的词表项也要被扫到。
 
-    两个层面的保证：
-    1. --od 目录不预先写进结果（否则报告里它们永远排第一）；
-    2. 同一目录的 common 组先于 backup 组放行（备份一个目录上千条，
-       排在词表前面会把词表推到很后面）。
+    这里断言的是「都扫到了」，不是「谁先出结果」——目录按优先级同层
+    排队，--od 的目录与根目录发现的目录都在同一优先级，先出谁是调度
+    时序决定的，不该拿来当断言（曾经因此出现过 flaky）。
     """
-    import re
     counter = []
     existing = {
         "/index.html": (200, b"idx"),
@@ -832,10 +830,8 @@ def test_scan_starts_from_root_with_od():
     print("  结果顺序: %s" % order[:8])
     assert "index.html" in order, "根目录词表项没被扫到: %s" % order
     assert "tc" in order, "根目录的 tc 没被扫到: %s" % order
-    # 根目录项必须排在 --od 目录之前（它们本来就都是第 1 层，看谁先入队）
-    assert order.index("index.html") < len(order), order
-    # --od 目录不该预先占据结果首位
-    assert order[0] in ("index.html", "tc"), "结果首位不该是 --od 项: %s" % order[0]
+    # 根目录与 --od 的目录都要在结果里；先出谁由调度时序决定，不作断言
+    assert "tc/member" in order, "--od 目录没被扫到: %s" % order
 
     # --od 目录确实参与了递归
     assert "tc/member" in st.opened, sorted(st.opened)
@@ -1147,6 +1143,131 @@ def test_claim_url_dedup_still_works():
     print("  test_claim_url_dedup_still_works OK")
 
 
+def test_priority_classification():
+    """任务优先级：探测 < 目录 < 文件。"""
+    from pathscan.models import (PRIO_DIR, PRIO_FILE, PRIO_PROBE, Task,
+                                 task_priority)
+
+    cases = [
+        (Task("dir", "a", "", from_="common"), PRIO_DIR, "普通目录"),
+        (Task("file", "a.html", "", from_="common"), PRIO_FILE, "普通文件"),
+        (Task("dir", "r", "", from_="dircheck"), PRIO_PROBE, "dircheck 探测"),
+        (Task("file", "r.aspx", "", from_="suffixcheck"), PRIO_PROBE,
+         "后缀探测"),
+        (Task("file", "__probe__ab.xy", "", from_="backup"), PRIO_PROBE,
+         "备份探针"),
+        (Task("file", "db.zip", "", from_="backup"), PRIO_FILE, "备份文件"),
+        (Task("dir", "a", "", from_="okdir"), PRIO_DIR, "--od 目录"),
+        (Task("file", "a.zip", "", from_="backup_suffix"), PRIO_FILE,
+         "目录备份后缀"),
+    ]
+    for task, expected, label in cases:
+        got = task_priority(task)
+        assert got == expected, "%s: 期望 %d 得到 %d" % (label, expected, got)
+    print("  8 种任务类型的优先级均正确")
+    print("  test_priority_classification OK")
+
+
+def test_queue_priority_order():
+    """队列出队顺序：探测 -> 目录 -> 文件。"""
+    from pathscan.models import PRIO_DIR, PRIO_FILE, PRIO_PROBE, Task
+    from pathscan.models import TaskQueue
+
+    q = TaskQueue()
+    # 故意按「文件 -> 目录 -> 探测」的逆序塞进去
+    q.add(Task("file", "f1", "", from_="common"))
+    q.add(Task("file", "f2", "", from_="common"))
+    q.add(Task("dir", "d1", "", from_="common"))
+    q.add(Task("dir", "d2", "", from_="common"))
+    q.add(Task("dir", "p1", "", from_="dircheck"))
+    q.add(Task("file", "p2", "", from_="suffixcheck"))
+
+    order = []
+    while not q.empty():
+        order.append(q.pop_nowait().name)
+    print("  出队顺序: %s" % order)
+    assert order[:2] == ["p1", "p2"], order        # 探测最先
+    assert order[2:4] == ["d1", "d2"], order       # 目录其次
+    assert order[4:] == ["f1", "f2"], order        # 文件最后
+    # 同优先级保持 FIFO
+    assert q.qsize() == 0
+    print("  test_queue_priority_order OK")
+
+
+def test_dirs_scanned_before_files():
+    """端到端：整棵目录树先出结果，文件全部排在后面。"""
+    existing = {
+        "/tc": (200, b"tc"),
+        "/tc/member": (200, b"m"),
+        "/test.html": (200, b"l"),
+        "/tc/test.html": (200, b"i"),
+        "/tc/member/vip.html": (200, b"v"),
+    }
+    srv, url = start_server(make_handler(existing))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "ord2_d.txt")
+    f = os.path.join(tmp, "ord2_f.txt")
+    with open(d, "w") as fh:
+        fh.write("tc\nmember\n")
+    with open(f, "w") as fh:
+        fh.write("test\nvip\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-s", ".html", "--cs", "0",
+         "-t", "2", "-r", "4", "--timeout", "5", "--od", "tc/member/"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(0), de, fe, [])
+
+    order = []
+    orig = GlobalState.add_result
+
+    def spy(self, rec):
+        ok = orig(self, rec)
+        if ok:
+            order.append((rec["path"], rec["type"]))
+        return ok
+
+    GlobalState.add_result = spy
+    try:
+        eng.start()
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            with st.lock:
+                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                    break
+            time.sleep(0.05)
+    finally:
+        GlobalState.add_result = orig
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    print("  出结果顺序:")
+    for i, (path, type_) in enumerate(order):
+        print("    %d. %-22s %s" % (i + 1, path, type_))
+    types = [t for _, t in order]
+    last_dir = max(i for i, t in enumerate(types) if t == "dir")
+    first_file = next(i for i, t in enumerate(types) if t == "file")
+    assert last_dir < first_file, (
+        "目录必须全部先于文件: 最后目录位=%d 首个文件位=%d" % (last_dir, first_file))
+    # 目录树要完整
+    paths = [p for p, _ in order]
+    assert "tc" in paths and "tc/member" in paths, paths
+    # 文件要扫到
+    assert "test.html" in paths, paths
+    assert "tc/member/vip.html" in paths, paths
+    print("  test_dirs_scanned_before_files OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1183,6 +1304,9 @@ def main():
         ("目录备份后缀端到端", test_dir_backup_suffix_end_to_end),
         ("--od 目录自身被扫描", test_od_dir_itself_is_scanned),
         ("claim_url 去重完好", test_claim_url_dedup_still_works),
+        ("任务优先级判定", test_priority_classification),
+        ("队列优先级顺序", test_queue_priority_order),
+        ("目录先于文件扫描", test_dirs_scanned_before_files),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

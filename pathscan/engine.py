@@ -47,9 +47,8 @@ class Worker(threading.Thread):
                     break
                 task = state.take()
                 if task is None:
-                    # take 返回 None：要么被终止，要么确实没活了
-                    if state.stop_flag or self.engine.should_retire(self):
-                        break
+                    # take 返回 None 只在「确实没活了」或「被终止」时——
+                    # 目录阶段压制文件任务时它会阻塞等待，不会返回 None。
                     break
                 try:
                     self.handle(task)
@@ -57,7 +56,7 @@ class Worker(threading.Thread):
                     self.engine.printer.raw("! 任务处理异常 %s: %r"
                                             % (task.path, exc))
                 finally:
-                    state.complete()
+                    state.complete(task)
         finally:
             with state.lock:
                 state.threads_alive -= 1

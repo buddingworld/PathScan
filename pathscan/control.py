@@ -346,6 +346,17 @@ class Controller(object):
         self.printer.raw("* 执行完成")
 
     # ------------------------------------------------------------------
+    def _queue_breakdown(self):
+        """队列按优先级的积压：`` [探测 2 / 目录 8 / 文件 46]``。"""
+        counts = self.state.queue.counts()
+        if not counts:
+            return ""
+        parts = []
+        for prio in sorted(counts):
+            name = models.PRIO_NAMES.get(prio, str(prio))
+            parts.append("%s %d" % (name, counts[prio]))
+        return " [%s]" % " / ".join(parts)
+
     def print_status(self):
         snap = self.state.snapshot()
         elapsed = max(snap["elapsed"], 1e-6)
@@ -356,8 +367,9 @@ class Controller(object):
         self.printer.raw("-" * 66)
         self.printer.raw(" 状态: %s" % ("已暂停" if not self.state.pause_event.is_set()
                                         else "运行中"))
-        self.printer.raw(" 已完成 %d  队列 %d  进行中 %d"
-                         % (snap["done"], snap["queued"], snap["active"]))
+        self.printer.raw(" 已完成 %d  队列 %d%s  进行中 %d"
+                         % (snap["done"], snap["queued"],
+                            self._queue_breakdown(), snap["active"]))
         self.printer.raw(" 结果 %d  忽略 %d  失败 %d  死目录 %d"
                          % (snap["results"], snap["ignored"], snap["errors"],
                             snap["dead_dirs"]))

@@ -9,7 +9,7 @@
 
 import itertools
 
-from .models import Task, join_path, rand_token
+from .models import PROBE_PREFIX, Task, join_path, rand_token
 
 # ----------------------------------------------------------------------
 # 备份文件名
@@ -110,9 +110,6 @@ def dircheck_group_id(parent):
 
 def suffix_group_id(parent, suffix):
     return ("suffix", parent, suffix)
-
-
-PROBE_PREFIX = "__probe__"
 
 
 def make_backup_probe_task(parent, remark=""):

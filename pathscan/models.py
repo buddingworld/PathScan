@@ -17,6 +17,22 @@ import time
 
 _RAND_CHARS = string.ascii_lowercase + string.digits
 
+# 备份探针的固定名前缀（probes.py 用它生成探针名）。
+# 放在 models 里是因为任务优先级要按它判断，而 models 不能反向依赖 probes。
+PROBE_PREFIX = "__probe__"
+
+# ----------------------------------------------------------------------
+# 任务优先级：数字越小越先执行
+# ----------------------------------------------------------------------
+# 探测任务必须最先跑：它们决定延迟组什么时候放行，排在后面会互相卡死。
+PRIO_PROBE = 0
+# 目录其次：先把整棵目录树铺完，才能发现所有子目录。
+PRIO_DIR = 1
+# 文件最后：等目录都扫完了再集中扫。
+PRIO_FILE = 2
+
+PRIO_NAMES = {PRIO_PROBE: "探测", PRIO_DIR: "目录", PRIO_FILE: "文件"}
+
 # 速度滑动窗口的桶数。速度 = 窗口内请求数 / SPEED_WINDOW，
 # 用 1 秒一个桶，所以这个值同时也是窗口的秒数。
 SPEED_WINDOW = 10
@@ -157,23 +173,110 @@ class Task(object):
             self.type, self.path, self.from_, self.trytimes)
 
 
+def task_priority(task):
+    """任务优先级：探测 < 目录 < 文件。
+
+    探测任务最高，因为它们决定延迟组何时放行；若排在目录/文件后面，
+    目录任务会一直等探测结论，而探测任务又排在它们后面 —— 直接死锁。
+
+    目录优先于文件，这样整棵目录树先铺开，文件最后集中扫。
+    """
+    if task.from_ in ("dircheck", "suffixcheck"):
+        return PRIO_PROBE
+    if task.from_ == "backup" and task.name.startswith(PROBE_PREFIX):
+        return PRIO_PROBE
+    return PRIO_DIR if task.type == "dir" else PRIO_FILE
+
+
 class TaskQueue(object):
-    """任务队列。对外暴露 add/extend/pop 接口。
+    """按优先级分层的任务队列，对外暴露 add/extend/pop 接口。
 
     规格里的 exec 示例是 ``test_list.add(123)``，所以队列必须有 add()。
     同时为了让 exec 塞进来的裸值不会让调度器崩，add/extend 会把非 Task 值
     包装成 Task。
+
+    内部按 PRIO_* 分成几个 FIFO 桶，出队时先掏优先级最高的非空桶。
+    这样只需在入队时分一次桶，出队是 O(1)，也不必每次排序。
     """
+
+    def __init__(self):
+        # 每个优先级一个 FIFO 桶
+        self.buckets = {}
+        self.count = 0
+
+    # ---- 内部 ----
+    def _bucket(self, prio):
+        b = self.buckets.get(prio)
+        if b is None:
+            b = self.buckets[prio] = _FifoBucket()
+        return b
+
+    # ---- 对外接口 ----
+    def add(self, item, priority=None):
+        task = _coerce_task(item)
+        prio = task_priority(task) if priority is None else priority
+        self._bucket(prio).add(task)
+        self.count += 1
+
+    def extend(self, items):
+        for item in items:
+            self.add(item)
+
+    def empty(self):
+        return self.count <= 0
+
+    def qsize(self):
+        return self.count
+
+    def pop_nowait(self):
+        """取一个任务：按优先级从高到低找第一个非空桶。"""
+        if self.count <= 0:
+            return None
+        for prio in sorted(self.buckets):
+            b = self.buckets[prio]
+            if not b.empty():
+                task = b.pop_nowait()
+                self.count -= 1
+                return task
+        return None
+
+    def peek_priority(self):
+        """看一眼下一个任务的优先级（不出队）。空队列返回 None。"""
+        if self.count <= 0:
+            return None
+        for prio in sorted(self.buckets):
+            if not self.buckets[prio].empty():
+                return prio
+        return None
+
+    def counts(self):
+        """各优先级的待处理数量，status 里用。"""
+        return dict((prio, b.qsize())
+                    for prio, b in self.buckets.items() if not b.empty())
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        """允许遍历待处理任务（exec / status 里会用到），按优先级顺序。"""
+        out = []
+        for prio in sorted(self.buckets):
+            out.extend(self.buckets[prio])
+        return iter(out)
+
+    def __repr__(self):
+        return "<TaskQueue %d 待处理 %s>" % (self.count, self.counts())
+
+
+class _FifoBucket(object):
+    """一个先进先出的桶，用头指针避免 pop(0) 的 O(n)。"""
 
     def __init__(self):
         self.items = []
         self.head = 0
 
-    def add(self, item):
-        self.items.append(_coerce_task(item))
-
-    def extend(self, items):
-        self.items.extend(_coerce_task(i) for i in items)
+    def add(self, task):
+        self.items.append(task)
 
     def empty(self):
         return self.head >= len(self.items)
@@ -187,20 +290,14 @@ class TaskQueue(object):
         item = self.items[self.head]
         self.items[self.head] = None
         self.head += 1
+        # 积压太多时压缩一次，回收前面的空位
         if self.head > 512 and self.head * 2 > len(self.items):
             del self.items[:self.head]
             self.head = 0
         return item
 
-    def __len__(self):
-        return self.qsize()
-
     def __iter__(self):
-        """允许遍历待处理任务（exec / status 里会用到）。"""
         return iter(self.items[self.head:])
-
-    def __repr__(self):
-        return "<TaskQueue %d 待处理>" % self.qsize()
 
 
 def _coerce_task(item):
@@ -232,6 +329,7 @@ class GlobalState(object):
         self.pending = 0           # 未完成任务总数（队列 + 在跑 + 等探测）
         self.active = 0            # 正在发请求的线程数
         self.done = 0              # 已处理完的任务数
+        self.inflight_dirs = 0     # 正在请求中的探测/目录任务数（用于目录阶段判定）
 
         # ---- 探测结论 ----
         self.dead_dirs = set()             # 判定为 404 的目录路径（前缀语义）
@@ -304,24 +402,55 @@ class GlobalState(object):
             self.cond.notify_all()
 
     def take(self):
-        """取一个任务。返回 None 表示队列已空，可以退出。"""
-        with self.cond:
-            while (not self.stop_flag and self.pending > 0
-                   and self.queue.empty()):
-                self.cond.wait(0.2)
-            if self.stop_flag or self.queue.empty():
-                return None
-            task = self.queue.pop_nowait()
-            self.active += 1
-            self.last_activity = time.time()
-            return task
+        """取一个任务。
 
-    def complete(self):
+        目录阶段未结束时不会返回文件任务 —— 这样整棵目录树先铺完，
+        文件最后集中扫。返回 None 表示确实没活了，可以退出。
+        """
+        with self.cond:
+            while not self.stop_flag:
+                if not self.queue.empty():
+                    prio = self.queue.peek_priority()
+                    # 目录阶段没结束就先把文件压住，等目录扫完
+                    if prio >= PRIO_FILE and not self.dir_phase_done():
+                        self.cond.wait(0.2)
+                        continue
+                    task = self.queue.pop_nowait()
+                    self.active += 1
+                    # 探测与目录任务都可能带来新的目录，计入在途
+                    if task_priority(task) < PRIO_FILE:
+                        self.inflight_dirs += 1
+                    self.last_activity = time.time()
+                    return task
+                if self.pending <= 0:
+                    return None
+                self.cond.wait(0.2)
+            return None
+
+    def dir_phase_done(self):
+        """目录阶段是否结束：没有待处理目录、没有在途目录/探测、没有未结算探测。
+
+        三个条件缺一不可：
+        * 队列里没有目录任务（含刚发现还没跑的）
+        * 没有正在请求中的目录/探测任务（它们可能展开出新目录）
+        * 没有等待结算的探测（结算时会放行新的目录任务）
+        """
+        if not self.queue.empty() and self.queue.peek_priority() < PRIO_FILE:
+            return False
+        if self.inflight_dirs > 0:
+            return False
+        if self.probe_wait:
+            return False
+        return True
+
+    def complete(self, task=None):
         """任务处理完毕（无论成功失败）。"""
         with self.cond:
             self.active -= 1
             self.pending -= 1
             self.done += 1
+            if task is not None and task_priority(task) < PRIO_FILE:
+                self.inflight_dirs -= 1
             self.last_activity = time.time()
             self.cond.notify_all()
 
