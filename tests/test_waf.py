@@ -739,11 +739,10 @@ def test_ok_dirs_skips_probe_and_recurses():
 
     by = {r["path"]: r for r in st.results}
     print("  结果: %s" % sorted(by))
-    by = {r["path"]: r for r in st.results}
-    # 两层都被登记为结果，from=okdir、code 为 None
-    assert by["admin"]["from"] == "okdir", by.get("admin")
-    assert by["admin/backend"]["from"] == "okdir", by.get("admin/backend")
-    assert by["admin"]["code"] is None and by["admin/backend"]["code"] is None
+    # --od 目录只是递归种子，不写进结果（避免抢在真实扫描前面）
+    assert "admin" not in by, "admin 未在靶机上，不该出现在结果里"
+    # 两层都被打开参与递归
+    assert "admin" in st.opened and "admin/backend" in st.opened, st.opened
     # 递归走到了第 3 层
     assert "admin/backend/users" in by, sorted(by)
     assert by["admin/backend/users"]["from"] == "common"
@@ -756,13 +755,142 @@ def test_ok_dirs_skips_probe_and_recurses():
     print("  --od 目录的 dircheck 请求数: %d (应为 0)" % len(od_probes))
     assert not od_probes, od_probes
 
-    # 报告里 --od 项标 [od]
+    # 报告里不应出现 [od] 占位项
     report = "\n".join(output.format_report(st, args))
     print("  --- 报告 ---")
     for line in report.splitlines():
         print("   |", line)
-    assert "[od]" in report, report
+    assert "[od]" not in report, report
     print("  test_ok_dirs_skips_probe_and_recurses OK")
+
+
+def test_scan_starts_from_root_with_od():
+    """--od 不能让扫描从 /tc 开始：根目录的词表项要先被扫到。
+
+    两个层面的保证：
+    1. --od 目录不预先写进结果（否则报告里它们永远排第一）；
+    2. 同一目录的 common 组先于 backup 组放行（备份一个目录上千条，
+       排在词表前面会把词表推到很后面）。
+    """
+    import re
+    counter = []
+    existing = {
+        "/index.html": (200, b"idx"),
+        "/tc": (200, b"tc"),
+        "/tc/member": (200, b"mem"),
+    }
+    srv, url = start_server(make_handler(existing, counter=counter))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "ord_d.txt")
+    f = os.path.join(tmp, "ord_f.txt")
+    with open(d, "w") as fh:
+        fh.write("tc\n")
+    with open(f, "w") as fh:
+        fh.write("index.html\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "4", "-r", "3", "--timeout", "5",
+         "--od", "tc/member/"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+
+    order = []
+    orig_add = GlobalState.add_result
+
+    def spy(self, rec):
+        ok = orig_add(self, rec)
+        if ok:
+            order.append(rec["path"])
+        return ok
+
+    GlobalState.add_result = spy
+    try:
+        eng.start()
+        # 只要根目录两项都扫到就可以收工，不必等 1184 个备份任务跑完
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if "index.html" in order and "tc" in order:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("超时未扫到根目录项: %s" % order)
+    finally:
+        GlobalState.add_result = orig_add
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    print("  结果顺序: %s" % order[:8])
+    assert "index.html" in order, "根目录词表项没被扫到: %s" % order
+    assert "tc" in order, "根目录的 tc 没被扫到: %s" % order
+    # 根目录项必须排在 --od 目录之前（它们本来就都是第 1 层，看谁先入队）
+    assert order.index("index.html") < len(order), order
+    # --od 目录不该预先占据结果首位
+    assert order[0] in ("index.html", "tc"), "结果首位不该是 --od 项: %s" % order[0]
+
+    # --od 目录确实参与了递归
+    assert "tc/member" in st.opened, sorted(st.opened)
+    print("  --od 参与递归: %s" % sorted(st.opened))
+    print("  test_scan_starts_from_root_with_od OK")
+
+
+def test_common_released_before_backup():
+    """同一目录放行时 common 组必须先于 backup 组。"""
+    st = GlobalState(mk_args())
+    st.register_probes("d", 1)
+    st.put_group("d", "common", [mk_task("zzz_wordlist")])
+    st.put_group("d", "backup", [mk_task("db.zip"), mk_task("web.rar")])
+    released = st.note_verdict("d", "dead", value=False)
+    names = [t.name for t in released]
+    print("  放行顺序: %s" % names)
+    assert names[0] == "zzz_wordlist", "common 必须排在最前: %s" % names
+    assert names[1:] == ["db.zip", "web.rar"], names
+    print("  test_common_released_before_backup OK")
+
+
+def test_pause_discards_inflight_live_log():
+    """暂停后在途请求返回的实时日志要被丢弃，不能污染提示行。"""
+    import io as _io
+
+    class FakeTTY(_io.StringIO):
+        def isatty(self):
+            return True
+
+    buf = FakeTTY()
+    pr = output.Printer(live=True, stream=buf)
+    args = mk_args()
+    st = GlobalState(args)
+    ctl = control.Controller(args, st, pr)
+
+    pr.live_line(0, "nope1", False, speed=10.0)     # 临时行
+    ctl.on_sigint(None, None)                        # 暂停
+    snapshot = buf.getvalue()
+
+    # 暂停期间在途请求返回
+    pr.live_line(1, "inflight", False, speed=58.4)
+    after = buf.getvalue()
+    print("  暂停后在途日志被丢弃: %s" % (after == snapshot))
+    assert after == snapshot, "暂停期间的实时日志应被丢弃: %r" % after[len(snapshot):]
+
+    # 暂停提示必须独立成行
+    idx = snapshot.find("====")
+    assert idx > 0 and snapshot[idx - 1] == "\n", repr(snapshot[idx - 3:idx])
+
+    # go 之后恢复输出
+    ctl.dispatch(control.parse_command("go"))
+    pr.live_line(2, "resumed", True, speed=1.0)
+    print("  go 后恢复输出: %s" % ("resumed" in buf.getvalue()))
+    assert "resumed" in buf.getvalue(), "go 之后应恢复实时日志"
+    print("  test_pause_discards_inflight_live_log OK")
 
 
 def main():
@@ -793,6 +921,9 @@ def main():
         ("示例提示", test_error_shows_demos),
         ("--od 解析", test_ok_dirs_parsing),
         ("--od 跳过探测并递归", test_ok_dirs_skips_probe_and_recurses),
+        ("从根目录开始扫", test_scan_starts_from_root_with_od),
+        ("common 先于 backup", test_common_released_before_backup),
+        ("暂停丢弃在途日志", test_pause_discards_inflight_live_log),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

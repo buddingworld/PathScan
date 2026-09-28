@@ -122,6 +122,8 @@ class Worker(threading.Thread):
                 engine.on_suffix_result(task, url, resp)
             else:
                 engine.on_backup_probe_result(task, url, resp)
+            # 根目录探测结算完就可以登记 --od 目录了
+            engine.maybe_open_ok_dirs()
             return
 
         # ---- 忽略规则：判定为 404，记入 Ignored Paths，不递归 ----
@@ -247,6 +249,9 @@ class Engine(object):
         self.files_ext_entries = []
         self.debug_on = False
         self._dir_entry_by_name = {}
+        # --od 的延迟登记状态（见 start / maybe_open_ok_dirs）
+        self._ok_dirs_pending = []
+        self._ok_dirs_done = True
 
     # ------------------------------------------------------------------
     def debug(self, msg):
@@ -388,8 +393,12 @@ class Engine(object):
         # 根目录：dircheck + 后缀探测 + 备份探针 + 备份任务
         self.open_dir("", is_root=True)
 
-        # --od 指定的目录：逐层视为已存在，不走探测，并且参与递归
-        self.open_ok_dirs()
+        # --od 指定的目录要等根目录结算后再打开，否则它们会插到根目录任务的
+        # 前面——根目录任务在等探测，--od 任务却立即放行，扫描就从
+        # /tc 而不是 / 开始了。
+        self._ok_dirs_pending = list(args.ok_dirs)
+        self._ok_dirs_done = not self._ok_dirs_pending
+        self.maybe_open_ok_dirs()
 
         with state.lock:
             self.printer.info("队列已就绪，启动 %d 个线程..." % args.thread)
@@ -398,32 +407,36 @@ class Engine(object):
             self.workers.append(w)
             w.start()
 
+    def maybe_open_ok_dirs(self):
+        """根目录结算完成后，再登记 --od 目录。
+
+        根目录的探测结论是「能不能扫」的前提（软 404 会直接终止），
+        而且先放行根目录任务才能保证扫描从 / 开始。
+        """
+        if self._ok_dirs_done:
+            return
+        with self.state.lock:
+            # 根目录还有探测在飞，继续等
+            if self.state.probe_wait.get(""):
+                return
+            self._ok_dirs_done = True
+        self.open_ok_dirs()
+
     def open_ok_dirs(self):
         """登记 --od 指定的目录。
 
         由浅到深逐层打开：--od dir1/dir2/dir3/ 会依次打开 dir1、
-        dir1/dir2、dir1/dir2/dir3，每一层都直接判定为存在并参与递归，
+        dir1/dir2、dir1/dir2/dir3，每一层都直接判定为存在、不走探测，
         这样不会因为中间层没出现在词表里而断链。
 
-        每层都会登记一条结果（--od 意味着「已确认存在」），但不会发请求。
+        注意这里**不**把 --od 目录写进结果——它们只是「已知存在的种子」。
+        写进结果的话它们会抢在真实扫描前面出现在报告里（--od 是启动时
+        同步处理的，而实际路径要等探测结算后才扫），看起来就像扫描是从
+        /tc 而不是 / 开始的。真实的 200/301 结果由扫描本身产生；
+        若某层确实访问不到，扫描结果里自然不会有它。
         """
-        args = self.args
-        for path in args.ok_dirs:
+        for path in self.args.ok_dirs:
             self.open_dir(path, assume_ok=True)
-            url = build_url(args.url, path, "dir", args.mode)
-            rec = {
-                "path": path,
-                "url": url,
-                "type": "dir",
-                "code": None,
-                "size": None,
-                "location": None,
-                "from": "okdir",
-                "remark": "",
-                "depth": path_depth(path),
-            }
-            if self.state.add_result(rec):
-                self.printer.raw("[od]     %s  (--od 已确认存在)" % url)
 
     def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。

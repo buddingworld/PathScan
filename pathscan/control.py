@@ -177,6 +177,7 @@ class Controller(object):
         self.printer.info("无人值守 %s，自动恢复扫描" % _human_wait(idle), tag="*")
         state.pause_requested = False
         state.pause_event.set()
+        self.printer.resume_live()
         with state.lock:
             state.cond.notify_all()
 
@@ -245,6 +246,8 @@ class Controller(object):
         return True
 
     def _readline(self):
+        # 提示符前先清掉可能残留的临时行，保证 prompt 从行首开始
+        self.printer.clear_pending()
         sys.stdout.write("pathscan> ")
         try:
             sys.stdout.flush()
@@ -270,6 +273,7 @@ class Controller(object):
             state.pause_event.set()
             with state.lock:
                 state.cond.notify_all()
+            self.printer.resume_live()
             self.printer.raw("* 继续扫描")
             return True
         if name == "pause":

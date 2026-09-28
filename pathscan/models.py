@@ -452,7 +452,12 @@ class GlobalState(object):
 
     @staticmethod
     def _select_releasable(groups, verdict):
-        """按探测结论过滤出可以放行的任务。"""
+        """按探测结论过滤出可以放行的任务。
+
+        放行顺序很重要：先 common 后 backup。备份任务一个目录就有上千个
+        （37 名称 × 32 后缀），如果它们排在词表条目前面，扫描前期看到的
+        全是备份名，用户指定的词表要很久才轮到。
+        """
         # 目录被判软 404：该目录下所有任务全部作废
         if verdict.get("dead"):
             return []
@@ -461,7 +466,11 @@ class GlobalState(object):
         backup_ok = verdict.get("backup")
         released = []
 
-        for key in list(groups.keys()):
+        # common 优先，之后才是 backup
+        keys = [k for k in ("common", "backup") if k in groups]
+        keys.extend(k for k in list(groups.keys()) if k not in keys)
+
+        for key in keys:
             tasks = groups.pop(key)
             # 备份探针命中（随机备份名居然存在）说明服务器对备份类路径放行，
             # 检测失去意义，整组丢掉

@@ -107,6 +107,7 @@ class Printer(object):
         self.stream = stream or sys.stdout
         self.live_enabled = bool(live) and not quiet and self._is_tty()
         self._pending_len = 0        # 当前未换行的临时行长度
+        self._live_paused = False    # 暂停期间不再输出实时日志
 
     def _is_tty(self):
         try:
@@ -157,6 +158,9 @@ class Printer(object):
 
         备注只在 ok（请求非 404，含未被规则视为 404）时显示——
         与备注的值本身无关，所以这里的门控不放给调用方。
+
+        暂停期间（suspend_live 之后）直接丢弃：在途请求返回时扫描已经停了，
+        再打日志会接在暂停提示或指令提示符后面。
         """
         # 先按「纯前缀 + 路径」拼，路径对齐到固定宽度
         head = "ThreadID:%d  ->  " % thread_id
@@ -167,6 +171,8 @@ class Printer(object):
         if ok and remark:
             text += "  #%s" % remark
         with self.lock:
+            if self._live_paused:
+                return
             if not self.live_enabled:
                 # 非 TTY：只保留命中行，免得 404 把文件刷爆
                 if ok:
@@ -193,12 +199,13 @@ class Printer(object):
             safe_print(text, self.stream)
 
     def suspend_live(self):
-        """暂停/中断前调用：把临时行收尾成独立的一行。
+        """暂停/中断前调用：把临时行收尾成独立的一行，并停止接收实时日志。
 
-        不这么做的话，Ctrl+C 的提示会接在实时日志那一行后面，看起来像日志的
-        一部分。
+        不这么做的话，Ctrl+C 的提示会接在实时日志那一行后面；而且在途请求
+        返回后还会继续打日志，接在提示或指令提示符后面。
         """
         with self.lock:
+            self._live_paused = True
             if not self._pending_len:
                 return
             try:
@@ -207,6 +214,16 @@ class Printer(object):
             except Exception:
                 pass
             self._pending_len = 0
+
+    def clear_pending(self):
+        """清掉未换行的临时行（提示符前调用）。"""
+        with self.lock:
+            self._clear_pending_locked()
+
+    def resume_live(self):
+        """恢复实时日志（继续扫描时调用）。"""
+        with self.lock:
+            self._live_paused = False
 
     def finish_live(self):
         """扫描结束：把残留的临时行清掉。"""
