@@ -224,7 +224,7 @@ ThreadID:1  ->  /admin    [ok ]  Speed: 0.9/s  #后台管理
 | `--of` | — | 结果导出路径 |
 | `--ir` | — | 忽略规则，2 参数可多次：`--ir <属性> <值>` |
 | `--br` | — | 排除路径规则，2 参数可多次：`--br <属性> <值>` |
-| `--proxy` | — | 代理，支持 `http/https/socks5/socks5h` |
+| `--proxy` | — | 代理，支持 `http/https/socks5/socks5h`。**不指定时完全不用代理**，环境变量与系统代理设置都会被忽略 |
 | `--ka` | 200 | 复用次数：`0`=无限，`N`=复用 N 次后重连，负数=不复用 |
 | `--rt` | 3 | 请求最大失败重试次数 |
 | `--timeout` | 10 | 单次请求超时秒数 |
@@ -255,6 +255,21 @@ python pathscan.py -u http://t -d d.txt -f f.txt --ir size 1234
 # 路径里含 logout 的一律不扫
 python pathscan.py -u http://t -d d.txt -f f.txt --br name logout
 ```
+
+## 代理
+
+只有 `--proxy` 显式指定时才走代理：
+
+```bash
+--proxy http://127.0.0.1:8081
+--proxy socks5h://127.0.0.1:1080
+```
+
+**未指定时不读环境变量，也不用系统代理。** requests 默认 `trust_env=True`，
+会去读 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，Windows 上还会读注册表里
+的系统代理设置。扫描目标通常在内网，被系统代理劫持会让请求全部失败或走到
+错误的出口，所以扫描器显式关闭了这个行为（顺带也不再读 `.netrc`，避免悄悄
+套用本机凭据）。
 
 ## 已知存在的目录（--od）
 

@@ -1268,6 +1268,119 @@ def test_dirs_scanned_before_files():
     print("  test_dirs_scanned_before_files OK")
 
 
+def test_proxy_env_ignored_without_flag():
+    """未指定 --proxy 时，环境变量里的代理必须被忽略。
+
+    requests 默认 trust_env=True，会读 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，
+    Windows 上还会读注册表里的系统代理。扫描目标常在内网，被系统代理
+    劫持会让请求全部失败，所以默认必须关掉。
+
+    注意只设 session.proxies = {} 没用：trust_env 为 True 时 requests 会把
+    环境代理 setdefault 合并进来，必须直接关 trust_env。
+    """
+    import os as _os
+
+    saved = {}
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy"):
+        saved[k] = _os.environ.get(k)
+        _os.environ[k] = "http://127.0.0.1:9999"      # 死端口
+    try:
+        from pathscan import scanner
+
+        # 1) 未指定 --proxy -> 不套用任何代理
+        args = cli.Args(cli.build_parser().parse_args(
+            ["-u", "http://t", "-d", "testd.txt", "-f", "testf.txt"]))
+        sc = scanner.Scanner(args, 0)
+        merged = sc.session.merge_environment_settings(
+            "http://t/x", sc.session.proxies, None, None, None)
+        print("  未指定 --proxy: trust_env=%s proxies=%s"
+              % (sc.session.trust_env, dict(merged.get("proxies") or {})))
+        assert sc.session.trust_env is False, "trust_env 必须为 False"
+        assert not merged.get("proxies"), (
+            "环境代理不应被套用: %r" % merged.get("proxies"))
+        sc.close()
+
+        # 2) 显式 --proxy -> 照常生效
+        args2 = cli.Args(cli.build_parser().parse_args(
+            ["-u", "http://t", "-d", "testd.txt", "-f", "testf.txt",
+             "--proxy", "http://127.0.0.1:8081"]))
+        sc2 = scanner.Scanner(args2, 0)
+        merged2 = sc2.session.merge_environment_settings(
+            "http://t/x", sc2.session.proxies, None, None, None)
+        print("  指定 --proxy : proxies=%s"
+              % dict(merged2.get("proxies") or {}))
+        assert merged2["proxies"].get("http") == "http://127.0.0.1:8081", (
+            merged2.get("proxies"))
+        sc2.close()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    print("  test_proxy_env_ignored_without_flag OK")
+
+
+def test_proxy_env_scan_works():
+    """环境代理指向死端口时，未指定 --proxy 的扫描仍应全部成功。"""
+    import os as _os
+
+    saved = {}
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        saved[k] = _os.environ.get(k)
+        _os.environ[k] = "http://127.0.0.1:9999"
+    existing = {"/tc": (200, b"tc"), "/tc/member": (200, b"member"),
+                "/test.html": (200, b"h")}
+    srv, url = start_server(make_handler(existing))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "px_d.txt")
+    f = os.path.join(tmp, "px_f.txt")
+    with open(d, "w") as fh:
+        fh.write("tc\nmember\n")
+    with open(f, "w") as fh:
+        fh.write("test\n")
+    try:
+        args = cli.Args(cli.build_parser().parse_args(
+            ["-u", url, "-d", d, "-f", f, "-s", ".html", "--cs", "0",
+             "-t", "2", "-r", "3", "--timeout", "5", "--od", "tc/member/"]))
+        de, _ = cli.load_wordlist(d, "dir")
+        fe, _ = cli.load_wordlist(f, "file")
+        printer = Cap()
+        st = GlobalState(args)
+        eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                           rules.BypassRules([]), rules.CaseFilter(0), de, fe, [])
+        try:
+            eng.start()
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                with st.lock:
+                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                        break
+                time.sleep(0.05)
+        finally:
+            st.pause_event.set()
+            with st.lock:
+                st.cond.notify_all()
+            for w in eng.workers:
+                w.join(timeout=3.0)
+    finally:
+        srv.shutdown()
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    paths = sorted(r["path"] for r in st.results)
+    print("  环境代理为死端口时的结果: %s  失败 %d" % (paths, len(st.errors)))
+    assert paths, "结果不该为空 —— 说明被环境代理劫持了"
+    assert not st.errors, "不该有失败: %s" % st.errors[:2]
+    print("  test_proxy_env_scan_works OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1307,6 +1420,8 @@ def main():
         ("任务优先级判定", test_priority_classification),
         ("队列优先级顺序", test_queue_priority_order),
         ("目录先于文件扫描", test_dirs_scanned_before_files),
+        ("环境代理默认忽略", test_proxy_env_ignored_without_flag),
+        ("环境代理下扫描正常", test_proxy_env_scan_works),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

@@ -125,6 +125,17 @@ class Scanner(object):
     def _make_session(self):
         args = self.args
         s = requests.Session()
+
+        # 不读环境/系统代理。requests 默认 trust_env=True，会去读
+        # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等环境变量，Windows 上还会读
+        # 注册表里的系统代理设置——扫描目标通常在内网，被系统代理劫持会让
+        # 请求全部失败或走到错误的出口。
+        #
+        # 注意只设 s.proxies = {} 是没用的：trust_env 为 True 时 requests 会把
+        # 环境代理 setdefault 合并进本次请求，必须直接关掉这个开关。
+        # 关掉后 .netrc 也不再被读取（避免悄悄套用本机凭据）。
+        s.trust_env = False
+
         # 线程自己的连接池：pool_maxsize 至少要够本线程用
         limit = args.ka_limit if args.keep_alive else 0
         adapter = LimitedHTTPAdapter(
@@ -144,12 +155,14 @@ class Scanner(object):
             s.headers.update(args.headers)
         if not args.keep_alive:
             s.headers["Connection"] = "close"
+
+        # --proxy 显式指定的代理才生效
         if args.proxy:
             s.proxies = {"http": args.proxy, "https": args.proxy}
-            if args.proxy.split("://", 1)[0].lower() == "socks5h":
-                # socks5h 表示由代理做 DNS 解析，requests 需要 socks5 前缀 +
-                # rdns；用 socks5h 会让 requests 走远端解析
-                s.proxies = {"http": args.proxy, "https": args.proxy}
+        else:
+            # 双保险：即使将来有人改回 trust_env，这里也把代理清空
+            s.proxies = {}
+
         s.verify = False
         return s
 
