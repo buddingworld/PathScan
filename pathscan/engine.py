@@ -311,10 +311,15 @@ class Engine(object):
     # 入队辅助
     # ------------------------------------------------------------------
     def filter_tasks(self, tasks):
-        """过滤任务：应用 --br 排除、rp 抑制、WAF 拉黑与 URL 去重。
+        """过滤任务：应用 --br 排除、rp 抑制与 WAF 拉黑。
 
         延迟组里的任务在「构建时」就要过一遍这里，不能等到放行时才过滤——
         放行走的 _select_releasable 只看探测结论，拿不到 --br 这些规则。
+
+        注意这里**不做** claim_url 去重：去重是「这个 URL 已被调度」的登记，
+        而延迟组是「将来可能调度」的暂存区。提前登记会让 --od 目录在构建
+        父目录的常规任务时就把自己的 URL 占掉，等真正放行时反被去重丢弃，
+        结果 --od 目录自己永远扫不到。
         """
         args = self.args
         state = self.state
@@ -334,15 +339,21 @@ class Engine(object):
             # WAF 自动检测加入忽略列表的名称，后续不再检测
             if state.is_name_bypassed(task.name):
                 continue
-
-            if not state.claim_url(path, task.type, bool(args.cs)):
-                continue
             accepted.append(task)
         return accepted
 
     def add_tasks(self, tasks, source=""):
-        """过滤后入队。"""
-        accepted = self.filter_tasks(tasks)
+        """过滤 + 去重后入队。
+
+        claim_url 放在真正入队的这一刻，保证「暂存」不消费去重名额。
+        """
+        accepted = []
+        for task in self.filter_tasks(tasks):
+            if not self.state.claim_url(task.path, task.type,
+                                        bool(self.args.cs)):
+                self.debug("去重跳过 %s" % task.path)
+                continue
+            accepted.append(task)
         if accepted:
             self.state.enqueue(accepted)
         return len(accepted)
@@ -428,21 +439,31 @@ class Engine(object):
     def open_ok_dirs(self):
         """登记 --od 指定的目录。
 
-        由浅到深逐层打开：--od dir1/dir2/dir3/ 会依次打开 dir1、
-        dir1/dir2、dir1/dir2/dir3，每一层都直接判定为存在、不走探测，
-        这样不会因为中间层没出现在词表里而断链。
+        由浅到深逐层处理：--od dir1/dir2/dir3/ 会依次处理 dir1、
+        dir1/dir2、dir1/dir2/dir3。每一层做两件事：
 
-        注意这里**不**把 --od 目录写进结果——它们只是「已知存在的种子」。
-        写进结果的话它们会抢在真实扫描前面出现在报告里（--od 是启动时
-        同步处理的，而实际路径要等探测结算后才扫），看起来就像扫描是从
-        /tc 而不是 / 开始的。真实的 200/301 结果由扫描本身产生；
-        若某层确实访问不到，扫描结果里自然不会有它。
+        1. **请求它自身** —— 这是关键。--od 只是「打开它以便向下递归」，
+           并不会请求这个目录；如果词表里没有同名的条目（或大小写对不上，
+           比如词表是 ``Member`` 而路径是 ``member``），这个真实存在的
+           目录就永远扫不到。
+        2. **打开它以便递归** —— 跳过探测，直接按「存在 + 后缀全可用」结算。
+
+        自身请求走正常入队（含 claim_url 去重），所以若词表之后又给出
+        同一个路径，只会有一个请求发出。
         """
-        for path in self.args.ok_dirs:
-            already = path in self.state.opened
+        args = self.args
+        for path in args.ok_dirs:
+            # 1) 请求目录自身（用 --od 给的原样路径）
+            url = build_url(args.url, path, "dir", args.mode)
+            if not self.state.is_dead_dir(path) and not self.state.is_suppressed(path):
+                task = Task(type="dir", name=path.rsplit("/", 1)[-1],
+                            parent=path.rsplit("/", 1)[0] if "/" in path else "",
+                            from_="okdir")
+                self.add_tasks([task])
+                self.debug("--od 请求目录自身 %s" % url)
+            # 2) 打开它以便向下递归
             self.open_dir(path, assume_ok=True)
-            self.debug("--od 登记 %r%s" % (path, "（已登记过，跳过）" if already
-                                           else ""))
+            self.debug("--od 打开递归 %r" % path)
 
     def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。
@@ -589,14 +610,36 @@ class Engine(object):
     # 递归
     # ------------------------------------------------------------------
     def expand_dir(self, task, url):
-        """命中一个目录后，按 -r 决定是否继续往下展开。"""
+        """命中一个目录后，追加它自身的打包备份，并按 -r 决定是否继续展开。
+
+        目录备份（admin/web/ -> admin/web.zip 等）与递归深度无关：目录已经
+        确认存在，它的备份是个叶子文件，不受 -r 限制，所以放在深度判断之前。
+        """
         args = self.args
         path = task.path
+        self.add_dir_backup_tasks(task)
+
         depth = path_depth(path)
         if depth >= args.recursion:
             return
         self._dir_entry_by_name[path] = {"remark": task.remark}
         self.open_dir(path)
+
+    def add_dir_backup_tasks(self, task):
+        """目录确认存在后，把它自身的打包备份加进队列。
+
+        如 admin/web/ 存在 -> 探 admin/web.tar.gz、admin/web.zip 等，
+        from 为 backup_suffix。
+        """
+        dirname = task.name
+        if not dirname:
+            return                      # 根目录没有「自己的名字」
+        tasks = probes.build_dir_backup_tasks(
+            task.parent, dirname, self.remark_for(task), task.waf)
+        n = self.add_tasks(tasks)
+        if n:
+            self.debug("目录 %s 命中，追加 %d 个自身备份任务"
+                       % (task.path, n))
 
 
 # ----------------------------------------------------------------------

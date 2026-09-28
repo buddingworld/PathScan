@@ -1,1 +1,2 @@
-- github project: https://github.com/buddingworld/PathScan branch:master,use this only when pulling or pushing to git is specified 
+- github project: https://github.com/buddingworld/PathScan branch:master,use this only when pulling or pushing to git is specified.
+- push to github only when user specify.don't push auto.

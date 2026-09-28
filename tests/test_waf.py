@@ -739,8 +739,8 @@ def test_ok_dirs_skips_probe_and_recurses():
 
     by = {r["path"]: r for r in st.results}
     print("  结果: %s" % sorted(by))
-    # --od 目录只是递归种子，不写进结果（避免抢在真实扫描前面）
-    assert "admin" not in by, "admin 未在靶机上，不该出现在结果里"
+    # --od 目录自身会被请求一次；admin 存在所以应出现在结果里
+    assert "admin" in by, "admin 存在, 应被 --od 请求到: %s" % sorted(by)
     # 两层都被打开参与递归
     assert "admin" in st.opened and "admin/backend" in st.opened, st.opened
     # 递归走到了第 3 层
@@ -980,6 +980,173 @@ def test_od_opens_when_root_probe_fails():
     print("  test_od_opens_when_root_probe_fails OK")
 
 
+def test_dir_backup_suffix_tasks():
+    """目录确认存在后，追加它自身的打包备份，from=backup_suffix。"""
+    from pathscan import probes
+
+    expect = [".tar.gz", ".7z", ".zip", ".rar", ".gz", ".tar",
+              ".bak", ".sql", ".txt"]
+    assert probes.DIR_BACKUP_SUFFIXES == expect, probes.DIR_BACKUP_SUFFIXES
+    print("  后缀列表: %s" % probes.DIR_BACKUP_SUFFIXES)
+
+    tasks = probes.build_dir_backup_tasks("admin", "web")
+    names = [t.name for t in tasks]
+    print("  任务: %s" % names[:4])
+    assert len(tasks) == len(expect), len(tasks)
+    for t in tasks:
+        assert t.from_ == "backup_suffix", t
+        assert t.type == "file", t
+        assert t.parent == "admin", t
+    assert names[0] == "web.tar.gz", names
+    assert "web.zip" in names and "web.txt" in names
+    print("  test_dir_backup_suffix_tasks OK")
+
+
+def test_dir_backup_suffix_end_to_end():
+    """目录命中后其备份被真的扫描到并带 backup_suffix 来源。"""
+    existing = {
+        "/admin": (200, b"a"),
+        # 用不在 BACKUP_NAMES 里的目录名，避免与既有 backup 组撞名
+        "/admin/portal": (200, b"p"),
+        "/admin/portal.zip": (200, b"PK"),
+        "/admin/portal.tar.gz": (200, b"TGZ"),
+    }
+    srv, url = start_server(make_handler(existing))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "dbs_d.txt")
+    f = os.path.join(tmp, "dbs_f.txt")
+    with open(d, "w") as fh:
+        fh.write("admin\nportal\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "4", "-r", "3", "--timeout", "5"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    try:
+        eng.start()
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            with st.lock:
+                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                    break
+            time.sleep(0.05)
+    finally:
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    by = {r["path"]: r for r in st.results}
+    print("  portal 相关结果: %s"
+          % sorted((k, v["from"]) for k, v in by.items() if "portal" in k))
+    assert "admin/portal" in by, sorted(by)
+    assert by["admin/portal"]["from"] == "common"
+    # 自身的打包备份被扫到，来源是 backup_suffix
+    assert "admin/portal.zip" in by, sorted(by)
+    assert by["admin/portal.zip"]["from"] == "backup_suffix", by["admin/portal.zip"]
+    assert "admin/portal.tar.gz" in by, sorted(by)
+    assert by["admin/portal.tar.gz"]["from"] == "backup_suffix"
+    print("  test_dir_backup_suffix_end_to_end OK")
+
+
+def test_od_dir_itself_is_scanned():
+    """--od 指定的目录自身必须被请求，否则它永远扫不到。
+
+    回归（用户实测 ``--od tc/member/`` 却扫不到 /tc/member）：--od 原先
+    只「打开目录以便递归」，从不请求目录自身。唯一会请求它的只有词表里
+    同名条目；而 d.txt 里是 ``Member``（大写），生成的是 /tc/Member，
+    真实存在的 /tc/member 就没人碰了。小写 member 恰好在词表里时才能扫到，
+    所以这个 bug 一直时隐时现。
+
+    这里覆盖三种写法，都必须扫到 /tc/member。
+    """
+    existing = {
+        "/tc": (200, b"tc"),
+        "/tc/member": (200, b"member"),
+        "/tc/member/deep": (200, b"deep"),
+    }
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+
+    for label, words, cs in (
+            ("Member 大写 cs=0", ["Member", "tc", "deep"], "0"),
+            ("member 小写 cs=0", ["member", "tc", "deep"], "0"),
+            ("Member 大写 cs=1", ["Member", "tc", "deep"], "1"),
+            ("词表无 member", ["tc", "deep"], "0"),
+    ):
+        srv, url = start_server(make_handler(existing))
+        d = os.path.join(tmp, "odself_d.txt")
+        f = os.path.join(tmp, "odself_f.txt")
+        with open(d, "w") as fh:
+            fh.write("".join(w + "\n" for w in words))
+        with open(f, "w") as fh:
+            fh.write("x\n")
+
+        args = cli.Args(cli.build_parser().parse_args(
+            ["-u", url, "-d", d, "-f", f, "-t", "4", "-r", "5",
+             "--timeout", "5", "--cs", cs, "--od", "tc/member/"]))
+        de, _ = cli.load_wordlist(d, "dir")
+        fe, _ = cli.load_wordlist(f, "file")
+        printer = Cap()
+        st = GlobalState(args)
+        eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                           rules.BypassRules([]), rules.CaseFilter(int(cs)),
+                           de, fe, [])
+        try:
+            eng.start()
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                with st.lock:
+                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                        break
+                time.sleep(0.05)
+        finally:
+            st.pause_event.set()
+            with st.lock:
+                st.cond.notify_all()
+            for w in eng.workers:
+                w.join(timeout=3.0)
+            srv.shutdown()
+
+        paths = sorted(r["path"] for r in st.results if "tc" in r["path"])
+        print("  %-18s -> %s" % (label, paths))
+        assert "tc/member" in paths, (
+            "%s: --od 目录自身没被扫到: %s" % (label, paths))
+        assert "tc" in paths, (label, paths)
+        assert "tc/member/deep" in paths, (
+            "%s: 递归没往下走: %s" % (label, paths))
+    print("  test_od_dir_itself_is_scanned OK")
+
+
+def test_claim_url_dedup_still_works():
+    """去重本身不能被破坏：同 (path,type) 第二次必须被拒。"""
+    st = GlobalState(mk_args())
+    assert st.claim_url("a", "dir", True) is True
+    assert st.claim_url("a", "dir", True) is False
+    # 类型不同各自独立
+    assert st.claim_url("a", "file", True) is True
+    # 大小写敏感时 Admin/admin 是两条
+    st2 = GlobalState(mk_args())
+    assert st2.claim_url("Admin", "dir", True) is True
+    assert st2.claim_url("admin", "dir", True) is True
+    # 不敏感时视为同一条
+    st3 = GlobalState(mk_args())
+    assert st3.claim_url("Admin", "dir", False) is True
+    assert st3.claim_url("admin", "dir", False) is False
+    print("  test_claim_url_dedup_still_works OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1012,6 +1179,10 @@ def main():
         ("common 先于 backup", test_common_released_before_backup),
         ("暂停丢弃在途日志", test_pause_discards_inflight_live_log),
         ("根目录探测失败仍开 --od", test_od_opens_when_root_probe_fails),
+        ("目录备份后缀任务", test_dir_backup_suffix_tasks),
+        ("目录备份后缀端到端", test_dir_backup_suffix_end_to_end),
+        ("--od 目录自身被扫描", test_od_dir_itself_is_scanned),
+        ("claim_url 去重完好", test_claim_url_dedup_still_works),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

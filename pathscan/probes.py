@@ -34,6 +34,14 @@ BACKUP_SUFFIXES = [
     ".json", ".yml", ".yaml", ".env", ".tar.bz2", ".war", ".jar", ".zip.bak",
 ]
 
+# 目录名本身 + 这些后缀，用于「目录已存在则试探它的打包备份」
+# 例如 /admin/web/ 存在 -> 再探 /admin/web.tar.gz 、/admin/web.zip ...
+# 与 BACKUP_SUFFIXES 分开：这份是短名单，只挑最常见的打包/备份格式。
+DIR_BACKUP_SUFFIXES = [
+    ".tar.gz", ".7z", ".zip", ".rar", ".gz", ".tar",
+    ".bak", ".sql", ".txt",
+]
+
 
 def build_backup_names(hostname):
     """按规格给的思路生成备份名，并做去重优化。
@@ -116,6 +124,25 @@ def make_backup_probe_task(parent, remark=""):
     name = "%s%s.%s" % (PROBE_PREFIX, rand_token(8), rand_token(4))
     return Task(type="file", name=name, parent=parent, from_="backup",
                 remark=remark)
+
+
+def build_dir_backup_tasks(parent, dirname, remark="", waf=0):
+    """目录确认存在后，把它自身的打包备份加进队列。
+
+    如 ``admin/web/`` 存在 -> 追加 ``admin/web.tar.gz``、``admin/web.zip`` 等。
+
+    ``parent`` 是该目录所在的父目录，``dirname`` 是它自己的名字。
+    生成的任务是文件类型，``from`` 为 ``backup_suffix``。
+    """
+    tasks = []
+    for suffix in DIR_BACKUP_SUFFIXES:
+        tasks.append(Task(type="file", name=dirname + suffix, parent=parent,
+                          from_="backup_suffix", remark=remark, waf=waf))
+    return tasks
+
+
+def dir_backup_group_id(parent, dirname):
+    return ("dirbackup", join_path(parent, dirname))
 
 
 # ----------------------------------------------------------------------

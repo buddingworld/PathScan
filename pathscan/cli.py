@@ -14,7 +14,8 @@ from . import mask as maskmod
 VERSION = "1.0.0"
 
 METHODS = ("get", "post", "head", "put", "delete", "options", "patch", "trace")
-FROM_VALUES = ("common", "suffixcheck", "dircheck", "backup")
+FROM_VALUES = ("common", "suffixcheck", "dircheck", "backup",
+               "backup_suffix")
 
 # 自定义字符集的编号范围：--cs1 ~ --cs9
 CS_INDICES = range(1, 10)
