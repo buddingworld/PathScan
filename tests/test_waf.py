@@ -1381,6 +1381,114 @@ def test_proxy_env_scan_works():
     print("  test_proxy_env_scan_works OK")
 
 
+def test_case_sensitive_flag_works():
+    """--cs 1 扫大小写两种，--cs 0 只扫一种。
+
+    回归：claim_url 去重原先只在 add_tasks（直接入队）里做，而延迟组
+    放行走 note_verdict -> queue.extend，完全绕过了去重。于是 --cs 0
+    下 assets 与 Assets 会被双双放行，--cs 看不出效果。
+    """
+    existing = {"/assets": (200, b"a"), "/Assets": (200, b"A")}
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "cs_d.txt")
+    f = os.path.join(tmp, "cs_f.txt")
+    with open(d, "w") as fh:
+        fh.write("assets\nAssets\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    got = {}
+    for cs in ("0", "1"):
+        srv, url = start_server(make_handler(existing))
+        args = cli.Args(cli.build_parser().parse_args(
+            ["-u", url, "-d", d, "-f", f, "--cs", cs, "-t", "1", "-r", "1",
+             "--timeout", "5"]))
+        de, _ = cli.load_wordlist(d, "dir")
+        fe, _ = cli.load_wordlist(f, "file")
+        printer = Cap()
+        st = GlobalState(args)
+        eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                           rules.BypassRules([]), rules.CaseFilter(int(cs)),
+                           de, fe, [])
+        try:
+            eng.start()
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                with st.lock:
+                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                        break
+                time.sleep(0.05)
+        finally:
+            st.pause_event.set()
+            with st.lock:
+                st.cond.notify_all()
+            for w in eng.workers:
+                w.join(timeout=3.0)
+            srv.shutdown()
+        got[cs] = sorted(r["path"] for r in st.results)
+        print("  --cs %s -> %s" % (cs, got[cs]))
+
+    assert got["1"] == ["Assets", "assets"], got["1"]
+    assert got["0"] == ["assets"], got["0"]
+    print("  test_case_sensitive_flag_works OK")
+
+
+def test_case_insensitive_dedup_in_subdirs():
+    """子目录展开时的大小写去重也要生效。"""
+    existing = {
+        "/tc": (200, b"tc"),
+        "/tc/assets": (200, b"a"),
+        "/tc/Assets": (200, b"A"),
+    }
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "cs2_d.txt")
+    f = os.path.join(tmp, "cs2_f.txt")
+    with open(d, "w") as fh:
+        fh.write("tc\nassets\nAssets\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    got = {}
+    for cs in ("0", "1"):
+        srv, url = start_server(make_handler(existing))
+        args = cli.Args(cli.build_parser().parse_args(
+            ["-u", url, "-d", d, "-f", f, "--cs", cs, "-t", "2", "-r", "3",
+             "--timeout", "5"]))
+        de, _ = cli.load_wordlist(d, "dir")
+        fe, _ = cli.load_wordlist(f, "file")
+        printer = Cap()
+        st = GlobalState(args)
+        eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                           rules.BypassRules([]), rules.CaseFilter(int(cs)),
+                           de, fe, [])
+        try:
+            eng.start()
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                with st.lock:
+                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                        break
+                time.sleep(0.05)
+        finally:
+            st.pause_event.set()
+            with st.lock:
+                st.cond.notify_all()
+            for w in eng.workers:
+                w.join(timeout=3.0)
+            srv.shutdown()
+        got[cs] = sorted(r["path"] for r in st.results)
+        print("  --cs %s -> %s" % (cs, got[cs]))
+
+    assert got["1"] == ["tc", "tc/Assets", "tc/assets"], got["1"]
+    # 不敏感：只保留先登记的那个（小写 assets 在同一目录内排在前）
+    assert got["0"] == ["tc", "tc/assets"], got["0"]
+    print("  test_case_insensitive_dedup_in_subdirs OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1422,6 +1530,8 @@ def main():
         ("目录先于文件扫描", test_dirs_scanned_before_files),
         ("环境代理默认忽略", test_proxy_env_ignored_without_flag),
         ("环境代理下扫描正常", test_proxy_env_scan_works),
+        ("--cs 大小写开关", test_case_sensitive_flag_works),
+        ("--cs 子目录去重", test_case_insensitive_dedup_in_subdirs),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

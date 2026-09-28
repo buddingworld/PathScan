@@ -449,8 +449,17 @@ class Engine(object):
 
         自身请求走正常入队（含 claim_url 去重），所以若词表之后又给出
         同一个路径，只会有一个请求发出。
+
+        注意 --od 的路径是用户明确声明的「存在」，它的去重优先级高于词表：
+        --cs 0 时若词表给的是不同大小写（用户写 tc/member，词表里是 Member），
+        两者会归一化成同一个 key；此时必须保住 --od 的那个，否则真实存在的
+        tc/member 会被 404 的 tc/Member 顶掉。做法是在 open_ok_dirs 之前
+        先把 --od 的路径登记进去重集合。
         """
         args = self.args
+        for path in args.ok_dirs:
+            # 先占去重名额，确保 --od 的大小写写法优先于词表
+            self.state.claim_url(path, "dir", bool(args.cs))
         for path in args.ok_dirs:
             # 1) 请求目录自身（用 --od 给的原样路径）
             url = build_url(args.url, path, "dir", args.mode)
@@ -458,7 +467,10 @@ class Engine(object):
                 task = Task(type="dir", name=path.rsplit("/", 1)[-1],
                             parent=path.rsplit("/", 1)[0] if "/" in path else "",
                             from_="okdir")
-                self.add_tasks([task])
+                # 上面已占过去重名额，这里绕过 claim_url 直接入队，
+                # 否则会被自己刚才的登记判为重复。
+                if self.filter_tasks([task]):
+                    self.state.enqueue([task])
                 self.debug("--od 请求目录自身 %s" % url)
             # 2) 打开它以便向下递归
             self.open_dir(path, assume_ok=True)

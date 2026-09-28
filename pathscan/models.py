@@ -321,6 +321,9 @@ class GlobalState(object):
 
     def __init__(self, args):
         self.args = args
+        # --cs：大小写是否敏感。去重要用它，所以状态里存一份，
+        # 让 note_verdict 的放行路径也能做大小写归一化。
+        self.case_sensitive = bool(getattr(args, "cs", 1))
 
         # ---- 任务队列与计数 ----
         self.lock = threading.RLock()
@@ -465,8 +468,13 @@ class GlobalState(object):
     # ------------------------------------------------------------------
     # 去重
     # ------------------------------------------------------------------
-    def claim_url(self, url, type_, case_sensitive=True):
-        """登记该 url 已被扫描。返回 True 表示这次是首次登记。"""
+    def claim_url(self, url, type_, case_sensitive=None):
+        """登记该 url 已被扫描。返回 True 表示这次是首次登记。
+
+        case_sensitive 为 None 时取本实例的 --cs 设置。
+        """
+        if case_sensitive is None:
+            case_sensitive = self.case_sensitive
         with self.lock:
             if case_sensitive:
                 key = (url, type_)
@@ -573,11 +581,20 @@ class GlobalState(object):
                 return []
 
             released = self._select_releasable(groups, verdict)
-            if released:
-                self.queue.extend(released)
-                self.pending += len(released)
+            # 放行的任务也要过一遍 URL 去重 —— 延迟组是「将来可能调度」的暂存区，
+            # 在这里才真正入队。少了这一步，--cs 0 下同一条路径的不同大小写
+            # （assets / Assets）会被双双放行，去重形同虚设。
+            accepted = []
+            for task in released:
+                if not self.claim_url(task.path, task.type,
+                                      self.case_sensitive):
+                    continue
+                accepted.append(task)
+            if accepted:
+                self.queue.extend(accepted)
+                self.pending += len(accepted)
             self.cond.notify_all()
-            return released
+            return accepted
 
     @staticmethod
     def _select_releasable(groups, verdict):
