@@ -1,7 +1,0 @@
-aaa
-api
-api1
-bbb
-.git
-.svn
-cgi-bin

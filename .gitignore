@@ -6,8 +6,7 @@ tests/_tmp/
 # Claude Code 本地权限配置（含本机路径，不入库）
 .claude/settings.local.json
 
-# 本地测试词表：已在仓库中，但本机改动不参与版本管理。
-# 仅靠 .gitignore 对已跟踪文件无效，需要配合（本机执行一次）：
-#   git update-index --skip-worktree testd.txt testf.txt
+# 本地测试词表：不入库，各机器自行准备。
+# 随便改不会被 push，也不会出现在 git status 里。
 testd.txt
 testf.txt
