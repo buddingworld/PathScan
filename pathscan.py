@@ -84,6 +84,7 @@ def main(argv=None):
     eng = engine.build(args, state, printer, ignore_rules, bypass_rules,
                        case_filter, dir_entries, file_entries,
                        files_ext_entries)
+    eng.debug_on = bool(args.debug)
     ctl.engine = eng
     ctl.namespace["engine"] = eng
 

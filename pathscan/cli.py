@@ -247,6 +247,8 @@ def build_parser():
                         "参与递归。可多次")
     g.add_argument("--cq", "--quiet", dest="quiet", action="store_true",
                    help="安静模式：不输出实时日志，只保留最终报告")
+    g.add_argument("--debug", dest="debug", action="store_true",
+                   help="输出诊断信息（探测结算、--od 登记、延迟组放行等）")
 
     p.add_argument("--version", action="version",
                    version="PathScan %s" % VERSION)

@@ -893,6 +893,93 @@ def test_pause_discards_inflight_live_log():
     print("  test_pause_discards_inflight_live_log OK")
 
 
+def test_od_opens_when_root_probe_fails():
+    """根目录探测网络失败时，--od 目录仍必须登记。
+
+    settle_failed_probe 走的是失败分支，不经过 handle 里的 is_probe 分支，
+    曾经因此漏掉 maybe_open_ok_dirs，导致 --od 子树整棵静默漏扫。
+    """
+    import re
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _handle(self):
+            path = self.path.split("?")[0]
+            # 随机探测名与备份探针一律断开连接 -> 触发 ConnectionError
+            if (re.match(r"^/[a-z0-9]{8}\.[a-z0-9]{4,5}$", path)
+                    or path.startswith("/__probe__")):
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
+            table = {"/tc": (200, b"tc"), "/tc/member": (200, b"m"),
+                     "/tc/admin": (200, b"a")}
+            code, body = table.get(path, (404, b""))
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        do_GET = _handle
+        do_HEAD = _handle
+
+    srv, url = start_server(H)
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "opf_d.txt")
+    f = os.path.join(tmp, "opf_f.txt")
+    with open(d, "w") as fh:
+        fh.write("tc\nmember\nadmin\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "2", "-r", "3", "--timeout", "3",
+         "--rt", "0", "--od", "tc/member/"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    try:
+        eng.start()
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            with st.lock:
+                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
+                    break
+            time.sleep(0.05)
+    finally:
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    print("  opened: %s" % sorted(st.opened))
+    print("  结果: %s" % sorted(r["url"].replace(url, "")
+                               for r in st.results))
+    # --od 两层都必须登记
+    assert "tc" in st.opened, "根目录探测失败时 --od 未登记: %s" % sorted(st.opened)
+    assert "tc/member" in st.opened, sorted(st.opened)
+    # 递归确实扫到了 tc/ 子树
+    paths = [r["url"].replace(url, "") for r in st.results]
+    assert "/tc" in paths, paths
+    assert "/tc/admin" in paths, "tc/ 子树漏扫: %s" % paths
+    print("  test_od_opens_when_root_probe_fails OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -924,6 +1011,7 @@ def main():
         ("从根目录开始扫", test_scan_starts_from_root_with_od),
         ("common 先于 backup", test_common_released_before_backup),
         ("暂停丢弃在途日志", test_pause_discards_inflight_live_log),
+        ("根目录探测失败仍开 --od", test_od_opens_when_root_probe_fails),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

@@ -416,10 +416,13 @@ class Engine(object):
         if self._ok_dirs_done:
             return
         with self.state.lock:
+            waiting = dict(self.state.probe_wait)
             # 根目录还有探测在飞，继续等
             if self.state.probe_wait.get(""):
                 return
             self._ok_dirs_done = True
+        self.debug("根目录探测结算完成（probe_wait=%s），开始登记 --od 目录"
+                   % (waiting or "空"))
         self.open_ok_dirs()
 
     def open_ok_dirs(self):
@@ -436,7 +439,10 @@ class Engine(object):
         若某层确实访问不到，扫描结果里自然不会有它。
         """
         for path in self.args.ok_dirs:
+            already = path in self.state.opened
             self.open_dir(path, assume_ok=True)
+            self.debug("--od 登记 %r%s" % (path, "（已登记过，跳过）" if already
+                                           else ""))
 
     def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。
@@ -575,6 +581,9 @@ class Engine(object):
             self.state.note_verdict(task.parent, "ext", "." + task.suffix, True)
         elif task.name.startswith(probes.PROBE_PREFIX):
             self.state.note_verdict(task.parent, "backup", value=True)
+        # 这条路径不走 handle 的 is_probe 分支，得自己检查 --od 能否登记，
+        # 否则根目录探测失败时 --od 目录永远不打开，整棵子树静默漏扫。
+        self.maybe_open_ok_dirs()
 
     # ------------------------------------------------------------------
     # 递归
