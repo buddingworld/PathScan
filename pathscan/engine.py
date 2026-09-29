@@ -47,9 +47,13 @@ class Worker(threading.Thread):
                     break
                 task = state.take()
                 if task is None:
-                    # take 返回 None 只在「确实没活了」或「被终止」时——
-                    # 目录阶段压制文件任务时它会阻塞等待，不会返回 None。
-                    break
+                    # take 返回 None 表示「暂时没活」。不能就此退出——用户在
+                    # 暂停时敲的 ed / od 会在扫描空转后追加新任务，线程必须
+                    # 还在，否则新任务没人消费。真正结束由主线程置 stop_flag。
+                    if state.stop_flag or self.retire:
+                        break
+                    state.wait_for_work()
+                    continue
                 try:
                     self.handle(task)
                 except Exception as exc:                # 任何任务级异常都不能杀线程
@@ -453,28 +457,42 @@ class Engine(object):
         注意 --od 的路径是用户明确声明的「存在」，它的去重优先级高于词表：
         --cs 0 时若词表给的是不同大小写（用户写 tc/member，词表里是 Member），
         两者会归一化成同一个 key；此时必须保住 --od 的那个，否则真实存在的
-        tc/member 会被 404 的 tc/Member 顶掉。做法是在 open_ok_dirs 之前
-        先把 --od 的路径登记进去重集合。
+        tc/member 会被 404 的 tc/Member 顶掉。做法是先占去重名额。
         """
-        args = self.args
-        for path in args.ok_dirs:
-            # 先占去重名额，确保 --od 的大小写写法优先于词表
-            self.state.claim_url(path, "dir", bool(args.cs))
-        for path in args.ok_dirs:
-            # 1) 请求目录自身（用 --od 给的原样路径）
-            url = build_url(args.url, path, "dir", args.mode)
-            if not self.state.is_dead_dir(path) and not self.state.is_suppressed(path):
-                task = Task(type="dir", name=path.rsplit("/", 1)[-1],
-                            parent=path.rsplit("/", 1)[0] if "/" in path else "",
-                            from_="okdir")
-                # 上面已占过去重名额，这里绕过 claim_url 直接入队，
-                # 否则会被自己刚才的登记判为重复。
-                if self.filter_tasks([task]):
-                    self.state.enqueue([task])
-                self.debug("--od 请求目录自身 %s" % url)
-            # 2) 打开它以便向下递归
-            self.open_dir(path, assume_ok=True)
-            self.debug("--od 打开递归 %r" % path)
+        for path in self.args.ok_dirs:
+            self.add_ok_dir(path)
+
+    def queue_dir(self, parent, name):
+        """把一个目录加入队列（ed 指令用）。返回入队数量（0/1）。
+
+        走正常流程：探测 -> 结算 -> 递归展开，所以新目录和词表来的
+        目录行为完全一致。已存在的结果不受影响。
+        """
+        task = Task(type="dir", name=name, parent=parent, from_="ed")
+        return self.add_tasks([task])
+
+    def add_ok_dir(self, path):
+        """把一个目录认定为已存在并加入递归（od 指令用）。返回是否新增。
+
+        与启动时 --od 的处理一致：请求目录自身 + 跳过探测直接打开递归。
+        已经处理过的层会被 claim_dir 挡下，不会重复。
+        """
+        if self.state.is_dead_dir(path):
+            self.debug("od 跳过 %r：已被判为软 404" % path)
+            return False
+        if path in self.state.opened:
+            self.debug("od 跳过 %r：已登记过" % path)
+            return False
+        # 先占去重名额，保证 od 的写法优先于词表里的大小写变体
+        self.state.claim_url(path, "dir", bool(self.args.cs))
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        task = Task(type="dir", name=path.rsplit("/", 1)[-1], parent=parent,
+                    from_="okdir")
+        if self.filter_tasks([task]):
+            self.state.enqueue([task])
+        self.open_dir(path, assume_ok=True)
+        self.debug("od 认定存在并加入递归 %r" % path)
+        return True
 
     def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。

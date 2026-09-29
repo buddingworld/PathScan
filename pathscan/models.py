@@ -430,6 +430,17 @@ class GlobalState(object):
                 self.cond.wait(0.2)
             return None
 
+    def wait_for_work(self, timeout=1.0):
+        """空转等待：没任务时挂起，有新任务入队会被 notify 唤醒。
+
+        主线程负责决定扫描何时真正结束（置 stop_flag），工作线程只需
+        在这里等着 —— 这样暂停期间追加的 ed / od 任务也有人消费。
+        """
+        with self.cond:
+            if self.stop_flag or self.pending > 0:
+                return
+            self.cond.wait(timeout)
+
     def dir_phase_done(self):
         """目录阶段是否结束：没有待处理目录、没有在途目录/探测、没有未结算探测。
 

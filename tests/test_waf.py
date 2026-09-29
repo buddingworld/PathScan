@@ -1489,6 +1489,194 @@ def test_case_insensitive_dedup_in_subdirs():
     print("  test_case_insensitive_dedup_in_subdirs OK")
 
 
+def wait_idle(st, timeout=120, quiet=0.8):
+    """等到扫描真正停下来。
+
+    不能用「pending 归零」单点判断：目录阶段结束、文件阶段还没放行的
+    瞬间也会满足，此时已知目录列表还不完整。这里要求连续 quiet 秒都空闲。
+    """
+    deadline = time.time() + timeout
+    idle_since = None
+    while time.time() < deadline:
+        with st.lock:
+            busy = st.pending > 0 or st.active > 0
+        if busy:
+            idle_since = None
+        else:
+            if idle_since is None:
+                idle_since = time.time()
+            elif time.time() - idle_since >= quiet:
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def test_parse_new_commands():
+    """ed / cs / od 的指令解析。"""
+    p = control.parse_command
+
+    c = p("ed dir1,dir2")
+    assert c.name == "ed" and c.arg == ["dir1", "dir2"], c
+    assert p("ed dir1").arg == ["dir1"]
+    assert p("ed  dir1 , dir2 ").arg == ["dir1", "dir2"]
+    assert p("ed dir1/").arg == ["dir1"]        # 容忍尾斜杠
+    assert p("ed").error
+    assert p("ed ,,").error
+
+    for val in ("1", "0"):
+        c = p("cs " + val)
+        assert c.name == "cs" and c.arg == int(val), c
+    for bad in ("cs", "cs 2", "cs abc"):
+        assert p(bad).error, bad
+
+    c = p("od dir1/dir2/dir3")
+    assert c.name == "od" and c.arg == "dir1/dir2/dir3", c
+    assert p("od dir1/").arg == "dir1"
+    assert p("od").error
+    print("  ed / cs / od 解析正确")
+    print("  test_parse_new_commands OK")
+
+
+def test_cs_command_toggles():
+    """cs 指令切换大小写敏感。"""
+    args = mk_args()
+    st = GlobalState(args)
+    printer = Cap()
+    ctl = control.Controller(args, st, printer)
+
+    assert args.cs == 1 and st.case_sensitive is True
+    ctl.dispatch(control.parse_command("cs 0"))
+    print("  cs 0 -> args.cs=%s state.case_sensitive=%s"
+          % (args.cs, st.case_sensitive))
+    assert args.cs == 0 and st.case_sensitive is False
+    ctl.dispatch(control.parse_command("cs 1"))
+    assert args.cs == 1 and st.case_sensitive is True
+    print("  test_cs_command_toggles OK")
+
+
+def test_ed_command_expands_to_known_dirs():
+    """ed 给每个已知存在的目录追加子目录，且不影响已有结果。"""
+    # 每个「已知存在目录 × ed 名字」的组合都真实存在，
+    # 否则扫到 404 只是没出现，无法验证 ed 是否真的补上了
+    existing = {
+        "/admin": (200, b"a"),
+        "/admin/images": (200, b"i"),
+        "/admin/images/test": (200, b"t"),
+    }
+    for base in ("", "admin", "admin/images", "admin/images/test"):
+        for name in ("dir1", "dir2"):
+            # 注意统一带前导斜杠：漏了就变成 "admin/dir1"，靶机取不到
+            existing["/" + (base + "/" + name if base else name)] = (200, b"x")
+    srv, url = start_server(make_handler(existing))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "ed_d.txt")
+    f = os.path.join(tmp, "ed_f.txt")
+    with open(d, "w") as fh:
+        fh.write("admin\nimages\ntest\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "4", "-r", "8", "--timeout", "5"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    ctl = control.Controller(args, st, printer, eng)
+    ctl.namespace["engine"] = eng
+    try:
+        eng.start()
+        wait_idle(st, timeout=60)
+        before = sorted(r["path"] for r in st.results)
+        print("  ed 前: %s" % before)
+        assert "admin/images/test" in before, before
+
+        # 已知存在目录应含根与各层
+        known = ctl.known_dirs()
+        print("  known_dirs: %s" % known)
+        assert known == ["", "admin", "admin/images", "admin/images/test"], known
+
+        ctl.dispatch(control.parse_command("ed dir1,dir2"))
+        wait_idle(st, timeout=90)
+    finally:
+        st.stop_flag = True
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    after = sorted(r["path"] for r in st.results)
+    print("  ed 后: %s" % after)
+    # 原有结果不受影响
+    for p in before:
+        assert p in after, "原有结果被破坏: %s" % p
+    # 每个已知存在目录下都补上了 dir1 / dir2
+    for base in ("", "admin", "admin/images", "admin/images/test"):
+        for name in ("dir1", "dir2"):
+            want = name if not base else base + "/" + name
+            assert want in after, "缺少 %s: %s" % (want, after)
+    print("  test_ed_command_expands_to_known_dirs OK")
+
+
+def test_od_command_adds_levels():
+    """od 逐层补上目录并参与递归。"""
+    existing = {
+        "/dir1": (200, b"1"),
+        "/dir1/dir2": (200, b"2"),
+        "/dir1/dir2/dir3": (200, b"3"),
+        "/dir1/dir2/dir3/deep.html": (200, b"d"),
+    }
+    srv, url = start_server(make_handler(existing))
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "od_d.txt")
+    f = os.path.join(tmp, "od_f.txt")
+    with open(d, "w") as fh:
+        fh.write("nothing\n")
+    with open(f, "w") as fh:
+        fh.write("deep\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-s", ".html", "-t", "2", "-r", "8",
+         "--timeout", "5"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    ctl = control.Controller(args, st, printer, eng)
+    ctl.namespace["engine"] = eng
+    try:
+        eng.start()
+        wait_idle(st, timeout=40)
+
+        ctl.dispatch(control.parse_command("od dir1/dir2/dir3"))
+        wait_idle(st, timeout=90)
+    finally:
+        st.stop_flag = True
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    paths = sorted(r["path"] for r in st.results)
+    print("  od 后结果: %s" % paths)
+    for want in ("dir1", "dir1/dir2", "dir1/dir2/dir3",
+                 "dir1/dir2/dir3/deep.html"):
+        assert want in paths, "缺少 %s: %s" % (want, paths)
+    print("  test_od_command_adds_levels OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1532,6 +1720,10 @@ def main():
         ("环境代理下扫描正常", test_proxy_env_scan_works),
         ("--cs 大小写开关", test_case_sensitive_flag_works),
         ("--cs 子目录去重", test_case_insensitive_dedup_in_subdirs),
+        ("ed/cs/od 指令解析", test_parse_new_commands),
+        ("cs 指令切换", test_cs_command_toggles),
+        ("ed 指令展开", test_ed_command_expands_to_known_dirs),
+        ("od 指令逐层补充", test_od_command_adds_levels),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):

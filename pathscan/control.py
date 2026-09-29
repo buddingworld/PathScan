@@ -19,12 +19,18 @@ import time
 from . import models
 from .output import safe_print
 
-COMMANDS = ("rp", "at", "status", "exec", "go", "pause", "stop", "help", "?")
+COMMANDS = ("rp", "at", "status", "exec", "go", "pause", "stop", "help", "?",
+            "ed", "cs", "od")
 
 _HELP = """
 可用指令:
   rp <path>      移除已存在的结果（前缀匹配，如 rp admin_x 清掉 admin_*）
   at <n>         增加 n 个线程；n 为负数表示减少
+  ed <dirs>      追加额外目录，逗号分隔（如 ed dir1,dir2）。
+                 已扫过的目录也会补上这些子目录；不影响已有结果
+  cs <0|1>       设置大小写敏感：1=敏感，0=不敏感
+  od <dir>       追加已知存在的目录（如 od dir1/dir2/dir3）。
+                 逐层检查，缺的层补上并认定为存在、参与递归
   status         显示当前扫描状态
   exec <code>    临时执行代码，如 exec test_list.add(123)
   go             继续扫描
@@ -39,6 +45,11 @@ def _human_wait(seconds):
     if seconds >= 60:
         return "%.0f 分钟" % (seconds / 60.0)
     return "%.0f 秒" % seconds
+
+
+# 连续空闲多久算扫描真正结束。工作线程在没活时不退出（暂停期间的
+# ed / od 需要它们消费），所以靠空闲时长判定收尾。
+IDLE_EXIT_SECONDS = 3.0
 
 
 class Command(object):
@@ -93,6 +104,27 @@ def parse_command(line):
         if not arg:
             return Command("exec", raw=line, error="exec 需要一段代码")
         return Command("exec", arg=arg, raw=line)
+    if name == "ed":
+        if not arg:
+            return Command("ed", raw=line, error="ed 需要至少一个目录名")
+        dirs = [d.strip().strip("/") for d in arg.split(",")]
+        dirs = [d for d in dirs if d]
+        if not dirs:
+            return Command("ed", raw=line, error="ed 的目录名不能为空")
+        return Command("ed", arg=dirs, raw=line)
+    if name == "cs":
+        if not arg:
+            return Command("cs", raw=line, error="cs 需要 0 或 1")
+        if arg not in ("0", "1"):
+            return Command("cs", raw=line, error="cs 只接受 0 或 1，收到 %r" % arg)
+        return Command("cs", arg=int(arg), raw=line)
+    if name == "od":
+        if not arg:
+            return Command("od", raw=line, error="od 需要一个目录路径")
+        text = arg.strip().strip("/")
+        if not text:
+            return Command("od", raw=line, error="od 的路径不能为空")
+        return Command("od", arg=text, raw=line)
     return Command("unknown", arg=line, raw=line,
                    error="未知指令 %r，输入 help 查看帮助" % name)
 
@@ -296,8 +328,80 @@ class Controller(object):
         if name == "exec":
             self.run_code(cmd.arg)
             return None
+        if name == "ed":
+            self.append_extra_dirs(cmd.arg)
+            return None
+        if name == "cs":
+            self.set_case_sensitive(cmd.arg)
+            return None
+        if name == "od":
+            self.append_ok_dirs(cmd.arg)
+            return None
         self.printer.raw("! 未知指令，输入 help 查看帮助")
         return None
+
+    # ------------------------------------------------------------------
+    # ed / cs / od
+    # ------------------------------------------------------------------
+    def known_dirs(self):
+        """已确认存在的目录（含根目录）。
+
+        取自扫描结果里 type == dir 的项 —— 这些是真实请求确认过存在的。
+        不含仅仅「打开过探测」的目录，因为那些未必真的存在。
+        """
+        with self.state.lock:
+            dirs = set([""])
+            for rec in self.state.results:
+                if rec.get("type") == "dir":
+                    dirs.add(rec["path"])
+            return sorted(dirs)
+
+    def append_extra_dirs(self, names):
+        """ed 指令：给每个已知存在的目录追加一批子目录。
+
+        例如已知存在 /admin/images/test，执行 ed dir1,dir2 后会补上
+        /dir1 /dir2 /admin/images/dir1 /admin/images/dir2
+        /admin/images/test/dir1 /admin/images/test/dir2
+
+        不影响已有结果，也不重置扫描；新任务按正常流程探测与递归。
+        """
+        if self.engine is None:
+            self.printer.raw("! 引擎未就绪，无法追加目录")
+            return
+        dirs = self.known_dirs()
+        added = 0
+        for base in dirs:
+            for name in names:
+                added += self.engine.queue_dir(base, name)
+        self.printer.raw("* ed 已追加 %d 个目录任务（覆盖 %d 个已存在目录 × %d 个名字）"
+                         % (added, len(dirs), len(names)))
+
+    def set_case_sensitive(self, value):
+        """cs 指令：切换大小写敏感。"""
+        self.args.cs = value
+        self.state.case_sensitive = bool(value)
+        self.printer.raw("* 大小写敏感已设为 %d（%s）"
+                         % (value, "敏感" if value else "不敏感"))
+
+    def append_ok_dirs(self, path):
+        """od 指令：追加已知存在的目录，逐层补齐并参与递归。
+
+        例如 od dir1/dir2/dir3 会依次处理 dir1、dir1/dir2、dir1/dir2/dir3：
+        每层若尚未被认定存在，就补上并直接认定为非 404、加入递归检测。
+        """
+        if self.engine is None:
+            self.printer.raw("! 引擎未就绪，无法追加目录")
+            return
+        levels = []
+        parts = [p for p in path.split("/") if p]
+        for i in range(1, len(parts) + 1):
+            levels.append("/".join(parts[:i]))
+        added = 0
+        for level in levels:
+            if self.engine.add_ok_dir(level):
+                added += 1
+        self.printer.raw("* od 已处理 %d 层（新增 %d），路径 %s"
+                         % (len(levels), added, "/".join(parts)))
 
     # ------------------------------------------------------------------
     def adjust_threads(self, delta):
@@ -404,17 +508,29 @@ def pause_loop(controller, engine):
     同时负责两件周期性工作：
     * 统计 WAF 观察窗口（5 秒到点就判定）；
     * 响应工作线程发起的 WAF 等待模式请求。
+
+    结束判定用「空闲计时」而不是「pending 归零」：工作线程在没活时不再
+    退出（暂停期间敲的 ed / od 会追加新任务，需要它们还在），所以空转是
+    正常状态。连续空闲超过 IDLE_EXIT_SECONDS 才认为扫描真的结束。
     """
     state = controller.state
     last_sweep = 0.0
+    idle_since = time.time()
     while True:
         with state.lock:
-            done = state.pending <= 0 and state.active <= 0
+            busy = state.pending > 0 or state.active > 0
             stopped = state.stop_flag
             notified = state.pause_requested
         if stopped:
             return False
-        if done:
+        if busy:
+            idle_since = time.time()
+        elif time.time() - idle_since >= IDLE_EXIT_SECONDS:
+            # 真的没活了，通知所有工作线程收工
+            state.stop_flag = True
+            state.pause_event.set()
+            with state.lock:
+                state.cond.notify_all()
             return True
 
         # WAF 观察窗口统计（每 0.5 秒扫一次，够及时也不费 CPU）
