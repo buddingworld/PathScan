@@ -17,7 +17,7 @@ import time
 
 from . import probes
 from .models import (THREAD_FAIL_LIMIT, THREAD_FAIL_PAUSE,
-                     WAF_FAIL_THRESHOLD, Task, path_depth)
+                     WAF_FAIL_THRESHOLD, Task, path_depth, suffix_of)
 from .output import safe_print
 from .scanner import Scanner, build_url
 
@@ -86,8 +86,8 @@ class Worker(threading.Thread):
             return
         # 该目录下这个后缀被判定为不可用
         if task.type == "file" and args.suffixes:
-            suf = "." + task.suffix
-            if not state.ext_usable(task.parent, suf):
+            suf = suffix_of(task.name)
+            if suf is not None and not state.ext_usable(task.parent, suf):
                 return
 
         scanner = self.scanner
@@ -605,7 +605,10 @@ class Engine(object):
     def on_suffix_result(self, task, url, resp):
         """后缀探测命中 => 该后缀在该目录下不可信，之后不再扫。"""
         state = self.state
-        suffix = "." + task.suffix
+        suffix = suffix_of(task.name)
+        if suffix is None:
+            self.debug("后缀探针 %s 无法解析后缀，忽略" % task.name)
+            return
         usable = not resp.exists
         if resp.exists:
             self.printer.info("后缀 %s 在 %s 下疑似被规则放行，跳过该后缀"
@@ -648,7 +651,9 @@ class Engine(object):
                        % (task.parent or "/"))
         elif task.from_ == "suffixcheck":
             # 探测失败时保守放行：少扫的风险大于多扫
-            self.state.note_verdict(task.parent, "ext", "." + task.suffix, True)
+            suffix = suffix_of(task.name)
+            if suffix is not None:
+                self.state.note_verdict(task.parent, "ext", suffix, True)
         elif task.name.startswith(probes.PROBE_PREFIX):
             # 探测失败时保守放行该后缀：少扫的风险大于多扫
             suffix = probes.backup_suffix_of(task.name, probes.BACKUP_SUFFIXES)

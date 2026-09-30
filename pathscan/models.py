@@ -300,17 +300,31 @@ class _FifoBucket(object):
         return iter(self.items[self.head:])
 
 
-def _match_backup_suffix(name, suffixes):
-    """找出文件名末尾匹配的后缀，取最长匹配。
+def suffix_of(name):
+    """取文件名的后缀：最后一个点之后的部分，返回带点的形式。
 
-    ``db.tar.gz`` 同时以 ``.gz`` 和 ``.tar.gz`` 结尾，必须优先认长的那个，
-    否则会按错误的后缀去查探测结论。suffixes 是 dict，键为后缀。
+    ``db.tar.gz`` -> ``.gz``（只看最后一个点，不把 ``.tar.gz`` 当整体）；
+    ``db.zip`` -> ``.zip``；无点或点在末尾则返回 ``None``。
+
+    与 ``Task.suffix`` 的区别：这里保留点、无点返回 None，方便调用方
+    直接与配置里的后缀（形如 ``.php``）比较。
     """
-    best = None
-    for suffix in suffixes:
-        if name.endswith(suffix) and (best is None or len(suffix) > len(best)):
-            best = suffix
-    return best
+    dot = name.rfind(".")
+    if dot < 0 or dot == len(name) - 1:
+        return None
+    return name[dot:]
+
+
+def _match_backup_suffix(name, suffixes):
+    """按最后一个点解析后缀，再在 suffixes 里查。
+
+    后缀统一取最后一个点之后的部分（``db.tar.gz`` 视为 ``.gz``）。
+    suffixes 是 dict，键为后缀；返回命中的键，没有则 None。
+    """
+    suffix = suffix_of(name)
+    if suffix is None:
+        return None
+    return suffix if suffix in suffixes else None
 
 
 def _coerce_task(item):
@@ -654,10 +668,11 @@ class GlobalState(object):
         for key in keys:
             tasks = groups.pop(key)
             for task in tasks:
-                # 该目录下这个后缀被判定为不可用
-                if key == "common" and task.type == "file" and "." in task.name:
-                    suffix = "." + task.name.rsplit(".", 1)[-1]
-                    if ext_ok.get(suffix) is False:
+                # 该目录下这个后缀被判定为不可用。
+                # 后缀统一取最后一个点之后的部分（.tar.gz 视为 .gz）。
+                if key == "common" and task.type == "file":
+                    suffix = suffix_of(task.name)
+                    if suffix is not None and ext_ok.get(suffix) is False:
                         continue
                 # 备份任务按自己的后缀逐个判断
                 if key == "backup" and backup_ok:

@@ -9,7 +9,7 @@
 
 import itertools
 
-from .models import PROBE_PREFIX, Task, join_path, rand_token
+from .models import PROBE_PREFIX, Task, join_path, rand_token, suffix_of
 
 # ----------------------------------------------------------------------
 # 备份文件名
@@ -26,19 +26,22 @@ BACKUP_NAMES = [
     "bin", "Bin", "BIN", "Root", "root", "ROOT",
 ]
 
-# 备份文件常用后缀，命中率远高于全后缀枚举
+# 备份文件常用后缀，命中率远高于全后缀枚举。
+# 后缀统一按「最后一个点」解析（db.tar.gz 视为 .gz），所以这里只列单点后缀：
+# 像 .tar.gz / .sql.gz / .zip.bak 这类写法永远不会被匹配到，反而白跑探测。
 BACKUP_SUFFIXES = [
-    ".zip", ".rar", ".tar", ".tar.gz", ".tgz", ".gz", ".7z", ".bz2",
+    ".zip", ".rar", ".tar", ".tgz", ".gz", ".7z", ".bz2",
     ".bak", ".backup", ".old", ".orig", ".save", ".swp", ".tmp", ".temp",
-    ".sql", ".sql.gz", ".dump", ".txt", ".log", ".xml", ".conf", ".ini",
-    ".json", ".yml", ".yaml", ".env", ".tar.bz2", ".war", ".jar", ".zip.bak",
+    ".sql", ".dump", ".txt", ".log", ".xml", ".conf", ".ini",
+    ".json", ".yml", ".yaml", ".env", ".war", ".jar",
 ]
 
 # 目录名本身 + 这些后缀，用于「目录已存在则试探它的打包备份」
 # 例如 /admin/web/ 存在 -> 再探 /admin/web.tar.gz 、/admin/web.zip ...
 # 与 BACKUP_SUFFIXES 分开：这份是短名单，只挑最常见的打包/备份格式。
+# 同样只列单点后缀。
 DIR_BACKUP_SUFFIXES = [
-    ".tar.gz", ".7z", ".zip", ".rar", ".gz", ".tar",
+    ".gz", ".7z", ".zip", ".rar", ".tar",
     ".bak", ".sql", ".txt",
 ]
 
@@ -130,16 +133,15 @@ def make_backup_probe_tasks(parent, suffixes, remark=""):
 
 
 def backup_suffix_of(name, suffixes):
-    """找出文件名匹配的备份后缀，取最长匹配。
+    """按最后一个点解析后缀，再在 suffixes 里查。
 
-    ``db.tar.gz`` 同时以 ``.gz`` 和 ``.tar.gz`` 结尾，必须优先认长的那个，
-    否则过滤时会按错误的后缀归类。
+    ``db.tar.gz`` 视为 ``.gz``（只看最后一个点）。suffixes 是可迭代的后缀
+    集合，返回命中的后缀，没有则 None。
     """
-    best = None
-    for suffix in suffixes:
-        if name.endswith(suffix) and (best is None or len(suffix) > len(best)):
-            best = suffix
-    return best
+    suffix = suffix_of(name)
+    if suffix is None:
+        return None
+    return suffix if suffix in suffixes else None
 
 
 def build_dir_backup_tasks(parent, dirname, remark="", waf=0):

@@ -974,7 +974,8 @@ def test_dir_backup_suffix_tasks():
     """目录确认存在后，追加它自身的打包备份，from=backup_suffix。"""
     from pathscan import probes
 
-    expect = [".tar.gz", ".7z", ".zip", ".rar", ".gz", ".tar",
+    # 后缀按「最后一个点」解析，所以这里只有单点后缀
+    expect = [".gz", ".7z", ".zip", ".rar", ".tar",
               ".bak", ".sql", ".txt"]
     assert probes.DIR_BACKUP_SUFFIXES == expect, probes.DIR_BACKUP_SUFFIXES
     print("  后缀列表: %s" % probes.DIR_BACKUP_SUFFIXES)
@@ -987,7 +988,7 @@ def test_dir_backup_suffix_tasks():
         assert t.from_ == "backup_suffix", t
         assert t.type == "file", t
         assert t.parent == "admin", t
-    assert names[0] == "web.tar.gz", names
+    assert names[0] == "web.gz", names
     assert "web.zip" in names and "web.txt" in names
     print("  test_dir_backup_suffix_tasks OK")
 
@@ -999,7 +1000,7 @@ def test_dir_backup_suffix_end_to_end():
         # 用不在 BACKUP_NAMES 里的目录名，避免与既有 backup 组撞名
         "/admin/portal": (200, b"p"),
         "/admin/portal.zip": (200, b"PK"),
-        "/admin/portal.tar.gz": (200, b"TGZ"),
+        "/admin/portal.gz": (200, b"GZ"),
     }
     srv, url = start_server(make_handler(existing))
     tmp = os.path.join(HERE, "_tmp")
@@ -1039,8 +1040,8 @@ def test_dir_backup_suffix_end_to_end():
     # 自身的打包备份被扫到，来源是 backup_suffix
     assert "admin/portal.zip" in by, sorted(by)
     assert by["admin/portal.zip"]["from"] == "backup_suffix", by["admin/portal.zip"]
-    assert "admin/portal.tar.gz" in by, sorted(by)
-    assert by["admin/portal.tar.gz"]["from"] == "backup_suffix"
+    assert "admin/portal.gz" in by, sorted(by)
+    assert by["admin/portal.gz"]["from"] == "backup_suffix"
     print("  test_dir_backup_suffix_end_to_end OK")
 
 
@@ -1644,6 +1645,36 @@ def test_od_command_adds_levels():
     print("  test_od_command_adds_levels OK")
 
 
+def test_suffix_takes_last_dot():
+    """后缀统一取最后一个点：.tar.gz 视为 .gz。"""
+    from pathscan.models import _match_backup_suffix, suffix_of
+    from pathscan import probes
+
+    cases = [
+        ("db.tar.gz", ".gz"),      # 多点只认最后一段
+        ("db.sql.gz", ".gz"),
+        ("db.zip.bak", ".bak"),
+        ("db.zip", ".zip"),
+        ("a.b.c.d", ".d"),
+        ("noext", None),           # 无点
+        ("trailing.", None),       # 点在末尾
+    ]
+    for name, want in cases:
+        got = suffix_of(name)
+        print("  suffix_of(%-12r) -> %r" % (name, got))
+        assert got == want, (name, got, want)
+
+    # 备份探针名也按同一规则归类
+    d = {x: True for x in probes.BACKUP_SUFFIXES}
+    print("  备份后缀表（只含单点后缀）: %d 个" % len(d))
+    for suffix in d:
+        assert suffix.count(".") == 1, "不应有多点后缀: %s" % suffix
+    assert _match_backup_suffix("db.tar.gz", d) == ".gz"
+    assert _match_backup_suffix("db.zip", d) == ".zip"
+    assert _match_backup_suffix("db.exe", d) is None
+    print("  test_suffix_takes_last_dot OK")
+
+
 def main():
     output.setup_console()
     tests = [
@@ -1691,6 +1722,7 @@ def main():
         ("cs 指令切换", test_cs_command_toggles),
         ("ed 指令展开", test_ed_command_expands_to_known_dirs),
         ("od 指令逐层补充", test_od_command_adds_levels),
+        ("后缀取最后一个点", test_suffix_takes_last_dot),
     ]
     failed = []
     for i, (name, fn) in enumerate(tests, 1):
