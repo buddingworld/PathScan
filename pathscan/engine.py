@@ -534,6 +534,10 @@ class Engine(object):
         # 3) 探测任务本身：直接入队
         probe_tasks = [probes.make_dircheck_task(dirpath)]
 
+        # 缓存命中的后缀结论要即时结算掉，它们不会再有探测任务。
+        # 注意必须在 register_probes 之前收集，否则 note_verdict 会先把
+        # probe_wait 减到负数，再被 register_probes 加回来，永远差几。
+        cached_verdicts = []
         if args.suffixes:
             # 每个后缀各探一次。祖先目录已探明的后缀可以跳过——
             # 同一个站点后缀可用性几乎不会随目录变化。
@@ -543,14 +547,21 @@ class Engine(object):
                 if cached is None:
                     pending_suffixes.append(suffix)
                 else:
-                    state.note_verdict(dirpath, "ext", suffix, cached)
+                    cached_verdicts.append(("ext", suffix, cached))
             if pending_suffixes:
                 probe_tasks.extend(
                     probes.make_suffix_probe_tasks(dirpath, pending_suffixes))
 
-        probe_tasks.append(probes.make_backup_probe_task(dirpath))
+        # 每个备份后缀各探一次，判断该后缀的备份是否被服务器一律放行
+        probe_tasks.extend(
+            probes.make_backup_probe_tasks(dirpath, probes.BACKUP_SUFFIXES))
 
-        state.register_probes(dirpath, len(probe_tasks))
+        # 注册「还要等几个探测结论」：入队数 + 走缓存直接结算的那几个。
+        # 用实际入队数而不是构造数，避免被 --br / 去重拦下的探针永远等不到。
+        state.register_probes(dirpath, len(probe_tasks) + len(cached_verdicts))
+        for kind, suffix, value in cached_verdicts:
+            state.note_verdict(dirpath, kind, suffix, value)
+
         n = self.add_tasks(probe_tasks, "probe")
         self.debug("展开目录 %r: 探测 %d 个, 暂存常规 %d / 备份 %d"
                    % (dirpath or "/", n, len(common), len(backup)))
@@ -605,15 +616,24 @@ class Engine(object):
         state.note_verdict(task.parent, "ext", suffix, usable)
 
     def on_backup_probe_result(self, task, url, resp):
-        """备份探针命中 => 服务器对备份类路径有特殊放行，备份检测失去意义。"""
+        """备份探针命中 => 该后缀的备份被服务器一律放行，跳过这个后缀。
+
+        逐后缀判定：只作废命中的那个后缀，其他后缀照常扫。
+        """
         state = self.state
+        suffix = probes.backup_suffix_of(task.name, probes.BACKUP_SUFFIXES)
+        if suffix is None:
+            self.debug("备份探针 %s 无法识别后缀，按通过处理" % task.name)
+            return
         value = not resp.exists
         if resp.exists:
-            self.printer.info("备份探针 %s 命中（%s -> %s），跳过该目录的备份检测"
-                              % (url, url, resp.code), tag="!")
+            self.printer.info("备份探针 %s%s 命中（-> %s），跳过 %s 后缀的备份检测"
+                              % (task.parent and task.parent + "/", suffix,
+                                 resp.code, suffix), tag="!")
         else:
-            self.debug("备份探针通过 %s" % (task.parent or "/"))
-        state.note_verdict(task.parent, "backup", value=value)
+            self.debug("备份探针通过 %s%s"
+                       % (task.parent and task.parent + "/", suffix))
+        state.note_verdict(task.parent, "backup", suffix, value)
 
     def settle_failed_probe(self, task):
         """探测任务重试超限后，按「结论未知」结算，放行该目录的任务。
@@ -630,7 +650,12 @@ class Engine(object):
             # 探测失败时保守放行：少扫的风险大于多扫
             self.state.note_verdict(task.parent, "ext", "." + task.suffix, True)
         elif task.name.startswith(probes.PROBE_PREFIX):
-            self.state.note_verdict(task.parent, "backup", value=True)
+            # 探测失败时保守放行该后缀：少扫的风险大于多扫
+            suffix = probes.backup_suffix_of(task.name, probes.BACKUP_SUFFIXES)
+            if suffix is not None:
+                self.state.note_verdict(task.parent, "backup", suffix, True)
+            else:
+                self.state.note_verdict(task.parent, "backup", None, True)
         # 这条路径不走 handle 的 is_probe 分支，得自己检查 --od 能否登记，
         # 否则根目录探测失败时 --od 目录永远不打开，整棵子树静默漏扫。
         self.maybe_open_ok_dirs()

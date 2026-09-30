@@ -112,15 +112,34 @@ def suffix_group_id(parent, suffix):
     return ("suffix", parent, suffix)
 
 
-def make_backup_probe_task(parent, remark=""):
-    """备份文件检测的探针：随机名 + 随机备份后缀。
+def make_backup_probe_tasks(parent, suffixes, remark=""):
+    """备份文件检测的探针：每个备份后缀各探一次。
 
-    名字带 __probe__ 前缀，engine 靠它把这个任务和真正的备份文件任务区分开
+    随机名 + 具体后缀（``__probe__ab12cd34.zip``、``__probe__ab12cd34.rar``），
+    用来逐个判断「该后缀的备份文件」是否被服务器放行。
+
+    用具体后缀而不是随机后缀：某些站点只对特定扩展名放行（比如对 .zip 一律
+    返回 200 的下载路由），用随机后缀要么撞不上、要么把结论张冠李戴。
+
+    名字带 ``__probe__`` 前缀，engine 靠它把探针和真正的备份任务区分开
     ——两者 from 都是 "backup"。
     """
-    name = "%s%s.%s" % (PROBE_PREFIX, rand_token(8), rand_token(4))
-    return Task(type="file", name=name, parent=parent, from_="backup",
-                remark=remark)
+    stem = PROBE_PREFIX + rand_token(8)
+    return [Task(type="file", name=stem + suffix, parent=parent,
+                 from_="backup", remark=remark) for suffix in suffixes]
+
+
+def backup_suffix_of(name, suffixes):
+    """找出文件名匹配的备份后缀，取最长匹配。
+
+    ``db.tar.gz`` 同时以 ``.gz`` 和 ``.tar.gz`` 结尾，必须优先认长的那个，
+    否则过滤时会按错误的后缀归类。
+    """
+    best = None
+    for suffix in suffixes:
+        if name.endswith(suffix) and (best is None or len(suffix) > len(best)):
+            best = suffix
+    return best
 
 
 def build_dir_backup_tasks(parent, dirname, remark="", waf=0):
@@ -148,10 +167,10 @@ def dir_backup_group_id(parent, dirname):
 def make_dircheck_task(parent, remark=""):
     """生成一个「必定不存在」的目录任务，用于判断服务器是否软 404。
 
-    随机名 + 随机后缀双随机：只随机名字的话，某些服务器会对「无后缀路径」
-    统一返回 200，探测结论就废了。
+    用纯随机名（8 位小写字母数字），不带后缀 —— 目录本来就不该带后缀，
+    带后缀反而可能被某些站点的「未知文件类型」规则特殊处理，结论失真。
     """
-    name = "%s.%s" % (rand_token(8), rand_token(5))
+    name = rand_token(8)
     return Task(type="dir", name=name, parent=parent, from_="dircheck",
                 remark=remark)
 

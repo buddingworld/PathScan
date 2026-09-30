@@ -300,6 +300,19 @@ class _FifoBucket(object):
         return iter(self.items[self.head:])
 
 
+def _match_backup_suffix(name, suffixes):
+    """找出文件名末尾匹配的后缀，取最长匹配。
+
+    ``db.tar.gz`` 同时以 ``.gz`` 和 ``.tar.gz`` 结尾，必须优先认长的那个，
+    否则会按错误的后缀去查探测结论。suffixes 是 dict，键为后缀。
+    """
+    best = None
+    for suffix in suffixes:
+        if name.endswith(suffix) and (best is None or len(suffix) > len(best)):
+            best = suffix
+    return best
+
+
 def _coerce_task(item):
     """exec 可能往队列里塞任意值，统一成 Task 以免调度器崩。
 
@@ -556,9 +569,15 @@ class GlobalState(object):
             self.groups.setdefault(dirpath, {})[key] = tasks
 
     def register_probes(self, dirpath, count):
+        """登记该目录还要等几个探测结论。
+
+        每个目录只登记一次（open_dir 由 claim_dir 保证），所以这里是赋值
+        而非累加 —— 累加会让重复登记把计数越推越大，永远减不到零。
+        """
         with self.lock:
-            self.probe_wait[dirpath] = self.probe_wait.get(dirpath, 0) + count
-            self.verdicts.setdefault(dirpath, {"dead": False, "exts": {}})
+            self.probe_wait[dirpath] = count
+            self.verdicts.setdefault(dirpath, {"dead": False, "exts": {},
+                                               "backups": {}})
 
     def note_verdict(self, dirpath, kind, key=None, value=None):
         """记录一条探测结论。返回本次结算后要放行的任务列表（可能为空）。
@@ -568,7 +587,7 @@ class GlobalState(object):
         """
         with self.lock:
             verdict = self.verdicts.setdefault(
-                dirpath, {"dead": False, "exts": {}, "backup": None})
+                dirpath, {"dead": False, "exts": {}, "backups": {}})
             if kind == "dead":
                 # value=False 表示 dircheck 通过（该目录不是软 404）。
                 # 只有明确命中才算死目录，漏掉这个判断会把每个目录都判死。
@@ -576,7 +595,10 @@ class GlobalState(object):
                     verdict["dead"] = True
                     self.dead_dirs.add(dirpath)
             elif kind == "backup":
-                verdict["backup"] = value
+                # 逐后缀判定：key 是备份后缀（.zip / .tar.gz ...），
+                # value=False 表示该后缀的探针命中（服务器对这类后缀一律放行），
+                # 该后缀的备份任务全部作废。
+                verdict["backups"][key] = value
             elif kind == "ext":
                 verdict["exts"][key] = value
                 self.ext_probe[(dirpath, key)] = value
@@ -620,7 +642,9 @@ class GlobalState(object):
             return []
 
         ext_ok = verdict.get("exts") or {}
-        backup_ok = verdict.get("backup")
+        # 逐后缀的备份结论：{".zip": False} 表示 .zip 的备份探针命中，
+        # 该后缀的备份任务不值得再扫（服务器对这类后缀一律放行）。
+        backup_ok = verdict.get("backups") or {}
         released = []
 
         # common 优先，之后才是 backup
@@ -629,14 +653,16 @@ class GlobalState(object):
 
         for key in keys:
             tasks = groups.pop(key)
-            # 备份探针命中（随机备份名居然存在）说明服务器对备份类路径放行，
-            # 检测失去意义，整组丢掉
-            if key == "backup" and backup_ok is False:
-                continue
             for task in tasks:
+                # 该目录下这个后缀被判定为不可用
                 if key == "common" and task.type == "file" and "." in task.name:
                     suffix = "." + task.name.rsplit(".", 1)[-1]
                     if ext_ok.get(suffix) is False:
+                        continue
+                # 备份任务按自己的后缀逐个判断
+                if key == "backup" and backup_ok:
+                    suffix = _match_backup_suffix(task.name, backup_ok)
+                    if suffix is not None and backup_ok.get(suffix) is False:
                         continue
                 released.append(task)
         return released

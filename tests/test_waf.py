@@ -723,12 +723,7 @@ def test_ok_dirs_skips_probe_and_recurses():
                        rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
     try:
         eng.start()
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            with st.lock:
-                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                    break
-            time.sleep(0.05)
+        wait_idle(st, timeout=60)
     finally:
         st.pause_event.set()
         with st.lock:
@@ -906,8 +901,9 @@ def test_od_opens_when_root_probe_fails():
 
         def _handle(self):
             path = self.path.split("?")[0]
-            # 随机探测名与备份探针一律断开连接 -> 触发 ConnectionError
-            if (re.match(r"^/[a-z0-9]{8}\.[a-z0-9]{4,5}$", path)
+            # 随机探测名（纯 8 位，无后缀）与备份探针一律断开连接
+            # -> 触发 ConnectionError，走 settle_failed_probe 结算
+            if (re.match(r"^/[a-z0-9]{8}$", path)
                     or path.startswith("/__probe__")):
                 self.close_connection = True
                 try:
@@ -939,7 +935,9 @@ def test_od_opens_when_root_probe_fails():
         fh.write("x\n")
 
     args = cli.Args(cli.build_parser().parse_args(
-        ["-u", url, "-d", d, "-f", f, "-t", "2", "-r", "3", "--timeout", "3",
+        # 这个靶机让所有探针都断开连接（最慢的失败方式）：33 个探针
+        # 各自要经历一次连接失败，线程太少会拖到分钟级。给足线程与超时。
+        ["-u", url, "-d", d, "-f", f, "-t", "8", "-r", "3", "--timeout", "2",
          "--rt", "0", "--od", "tc/member/"]))
     de, _ = cli.load_wordlist(d, "dir")
     fe, _ = cli.load_wordlist(f, "file")
@@ -949,12 +947,8 @@ def test_od_opens_when_root_probe_fails():
                        rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
     try:
         eng.start()
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            with st.lock:
-                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                    break
-            time.sleep(0.05)
+        # 该靶机让所有探针都断开连接（最慢的失败方式），33 个探针需要时间消化
+        wait_idle(st, timeout=180, quiet=1.5)
     finally:
         st.pause_event.set()
         with st.lock:
@@ -1028,12 +1022,7 @@ def test_dir_backup_suffix_end_to_end():
                        rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
     try:
         eng.start()
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            with st.lock:
-                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                    break
-            time.sleep(0.05)
+        wait_idle(st, timeout=90)
     finally:
         st.pause_event.set()
         with st.lock:
@@ -1101,12 +1090,7 @@ def test_od_dir_itself_is_scanned():
                            de, fe, [])
         try:
             eng.start()
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                with st.lock:
-                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                        break
-                time.sleep(0.05)
+            wait_idle(st, timeout=120)
         finally:
             st.pause_event.set()
             with st.lock:
@@ -1236,12 +1220,7 @@ def test_dirs_scanned_before_files():
     GlobalState.add_result = spy
     try:
         eng.start()
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            with st.lock:
-                if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                    break
-            time.sleep(0.05)
+        wait_idle(st, timeout=120)
     finally:
         GlobalState.add_result = orig
         st.pause_event.set()
@@ -1354,12 +1333,7 @@ def test_proxy_env_scan_works():
                            rules.BypassRules([]), rules.CaseFilter(0), de, fe, [])
         try:
             eng.start()
-            deadline = time.time() + 90
-            while time.time() < deadline:
-                with st.lock:
-                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                        break
-                time.sleep(0.05)
+            wait_idle(st, timeout=90)
         finally:
             st.pause_event.set()
             with st.lock:
@@ -1414,12 +1388,7 @@ def test_case_sensitive_flag_works():
                            de, fe, [])
         try:
             eng.start()
-            deadline = time.time() + 60
-            while time.time() < deadline:
-                with st.lock:
-                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                        break
-                time.sleep(0.05)
+            wait_idle(st, timeout=60)
         finally:
             st.pause_event.set()
             with st.lock:
@@ -1467,12 +1436,7 @@ def test_case_insensitive_dedup_in_subdirs():
                            de, fe, [])
         try:
             eng.start()
-            deadline = time.time() + 90
-            while time.time() < deadline:
-                with st.lock:
-                    if (st.pending <= 0 and st.active <= 0) or st.stop_flag:
-                        break
-                time.sleep(0.05)
+            wait_idle(st, timeout=90)
         finally:
             st.pause_event.set()
             with st.lock:
@@ -1492,14 +1456,17 @@ def test_case_insensitive_dedup_in_subdirs():
 def wait_idle(st, timeout=120, quiet=0.8):
     """等到扫描真正停下来。
 
-    不能用「pending 归零」单点判断：目录阶段结束、文件阶段还没放行的
-    瞬间也会满足，此时已知目录列表还不完整。这里要求连续 quiet 秒都空闲。
+    不能用「pending 归零」单点判断，两个坑：
+    * 目录阶段结束、文件阶段还没放行的瞬间也会满足，此时已知目录列表
+      还不完整；
+    * start() 刚返回、open_dir 尚未跑完的瞬间同样满足。
+    所以还要求 probe_wait 为空（没有未结算的探测），且连续 quiet 秒空闲。
     """
     deadline = time.time() + timeout
     idle_since = None
     while time.time() < deadline:
         with st.lock:
-            busy = st.pending > 0 or st.active > 0
+            busy = st.pending > 0 or st.active > 0 or bool(st.probe_wait)
         if busy:
             idle_since = None
         else:
