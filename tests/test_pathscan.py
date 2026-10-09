@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pathscan import cli, control, engine, output, rules  # noqa: E402
+from pathscan import cli, control, engine, output, probes, rules  # noqa: E402
 from pathscan.models import GlobalState  # noqa: E402
 from pathscan.scanner import Scanner  # noqa: E402
 
@@ -279,6 +279,43 @@ def test_size_uses_bytes_not_chars():
     print("  test_size_uses_bytes_not_chars OK")
 
 
+def test_no_bak_skips_backup_paths():
+    """--nb：不自动添加任何备份路径（备份文件、备份探针、目录自身备份）。
+
+    同一靶机跑两次对照：默认会发备份探针、扫备份文件、追加目录自身备份；
+    --nb 时这些请求一条都不发，常规扫描不受影响。
+    """
+    existing = {"/admin": (200, b"admin"), "/index.html": (200, b"i")}
+    base = ["-t", "4", "-r", "1", "--timeout", "5"]
+
+    def scan(extra):
+        counter = []
+        srv, url = start_server(make_handler(existing, counter=counter))
+        try:
+            res, err, st, out = run_scan(url, ["admin"], ["index"],
+                                         extra=extra)
+        finally:
+            srv.shutdown()
+        return res, url, [p.split("?")[0] for p in counter]
+
+    # 对照组：默认行为
+    res0, url0, paths0 = scan(base)
+    assert [p for p in paths0 if "__probe__" in p], "默认应发备份探针"
+    assert "/db.zip" in paths0, "默认应扫备份文件"
+    assert "/admin.gz" in paths0, "默认应追加目录自身备份"
+    assert url0 + "/admin" in [r["url"] for r in res0], res0
+    print("  默认请求数 %d" % len(paths0))
+
+    # --nb：备份相关请求一条都不该出现
+    res1, url1, paths1 = scan(base + ["--nb"])
+    print("  --nb 请求数 %d: %s" % (len(paths1), paths1))
+    assert not [p for p in paths1 if "__probe__" in p], paths1
+    bak_suffixes = tuple(probes.BACKUP_SUFFIXES + probes.DIR_BACKUP_SUFFIXES)
+    assert not [p for p in paths1 if p.lower().endswith(bak_suffixes)], paths1
+    assert url1 + "/admin" in [r["url"] for r in res1], res1
+    print("  test_no_bak_skips_backup_paths OK")
+
+
 def test_dead_suffix_skipped():
     """后缀探测语义（按规格）：
 
@@ -498,6 +535,7 @@ def main():
         ("软 404 终止", test_soft404_root_aborts),
         ("--ir 作用于探针", test_ir_applies_to_probes),
         ("size 用字节数", test_size_uses_bytes_not_chars),
+        ("--nb 不扫备份", test_no_bak_skips_backup_paths),
         ("后缀探测通过则照常扫", test_dead_suffix_skipped),
         ("后缀被放行则跳过", test_suffix_lied_about),
         ("--ir 规则", test_ignore_rules),

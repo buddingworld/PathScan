@@ -524,11 +524,15 @@ class Engine(object):
 
         # 2) 备份任务：同样过滤后暂存，备份探针命中才放行。
         #    这是规格里「优化实现」的关键——不探测就为每个目录发上千个请求。
-        backup = self.filter_tasks(
-            probes.build_backup_tasks(args, self.hostname, dirpath,
-                                      self.remark_for(
-                                          Task("dir", "", dirpath))))
-        state.put_group(dirpath, "backup", backup)
+        #    --nb 时整块跳过：不生成备份任务也不发备份探针（见下面第 3 步），
+        #    这样连「暂存后无探针可等」这种半吊子状态都不会出现。
+        backup = []
+        if not args.nb:
+            backup = self.filter_tasks(
+                probes.build_backup_tasks(args, self.hostname, dirpath,
+                                          self.remark_for(
+                                              Task("dir", "", dirpath))))
+            state.put_group(dirpath, "backup", backup)
 
         # --od：已知存在，不走探测，直接按「存在 + 后缀全可用」结算放行
         if assume_ok:
@@ -560,8 +564,9 @@ class Engine(object):
                     probes.make_suffix_probe_tasks(dirpath, pending_suffixes))
 
         # 每个备份后缀各探一次，判断该后缀的备份是否被服务器一律放行
-        probe_tasks.extend(
-            probes.make_backup_probe_tasks(dirpath, probes.BACKUP_SUFFIXES))
+        if not args.nb:
+            probe_tasks.extend(
+                probes.make_backup_probe_tasks(dirpath, probes.BACKUP_SUFFIXES))
 
         # 注册「还要等几个探测结论」：入队数 + 走缓存直接结算的那几个。
         # 用实际入队数而不是构造数，避免被 --br / 去重拦下的探针永远等不到。
@@ -701,8 +706,10 @@ class Engine(object):
         """目录确认存在后，把它自身的打包备份加进队列。
 
         如 admin/web/ 存在 -> 探 admin/web.tar.gz、admin/web.zip 等，
-        from 为 backup_suffix。
+        from 为 backup_suffix。--nb 关闭所有自动备份路径，这里直接跳过。
         """
+        if self.args.nb:
+            return
         dirname = task.name
         if not dirname:
             return                      # 根目录没有「自己的名字」

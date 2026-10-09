@@ -107,6 +107,9 @@ _EPILOG = """
        --br name logout          名称含 logout
        --br path /static/        路径含 /static/
 
+--nb  不自动添加备份路径探测（备份文件、备份探针、目录自身备份）
+       --nb
+
 --proxy  代理
        --proxy http://127.0.0.1:8081
        --proxy socks5h://127.0.0.1:1080
@@ -237,6 +240,10 @@ def build_parser():
     g.add_argument("--br", "--bypass-rules", dest="br", nargs=2,
                    action="append", metavar=("ATTR", "VALUE"),
                    help="排除路径规则，可多次。ATTR: %s" % _BR_ATTRS)
+    g.add_argument("--nb", "--no-bak", dest="nb", action="store_true",
+                   help="不自动添加备份路径：不扫备份文件（名称×后缀）、"
+                        "不发备份探针、也不追加目录自身备份。词表里手写的"
+                        "备份名不受影响")
 
     g = p.add_argument_group("输出")
     g.add_argument("--of", "--output-file", dest="of", metavar="FILE",
