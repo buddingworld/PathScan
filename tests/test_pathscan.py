@@ -456,6 +456,105 @@ def test_bypass_rules():
     print("  test_bypass_rules OK")
 
 
+def test_waf_dir_skips_its_backups():
+    """标注 waf 的目录被拉黑后，不再扫它自己的备份（.svn -> .svn.zip 等）。
+
+    靶机对任何含 .svn 的路径都回 403（模拟 WAF 拦截）。403 不在
+    「不存在」状态码里，若照常扫备份，.svn.zip / .svn.bak 会被记成一堆
+    假命中。.svn 本身命中后 waf=1 即超标拉黑，其备份应全部跳过。
+    """
+    counter = []
+
+    class WafHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path)
+            path = self.path.split("?")[0]
+            if ".svn" in path:
+                return self._send(403, b"waf blocked")
+            if path == "/.svn" or path == "/":
+                return self._send(200, b"ok")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(WafHandler)
+    try:
+        res, err, st, out = run_scan(
+            url, ['.svn#{"waf":1}', "admin"], ["x"],
+            extra=["-t", "1", "-r", "1", "--timeout", "5"])
+    finally:
+        srv.shutdown()
+
+    # .svn 本身命中了
+    urls = [r["url"] for r in res]
+    print("  results:", urls)
+    assert url + "/.svn" in urls, urls
+    # 它的备份一个都没发（含 WAF 标记的目录不再追加自身备份）
+    bak = [p for p in counter if p.startswith("/.svn.")]
+    print("  .svn 自身备份请求:", bak)
+    assert not bak, "被 WAF 拉黑的目录不该扫备份: %s" % bak
+    assert not [p for p in counter
+                if p.startswith("/.svn.") and p.endswith(".zip")]
+    # 也没有出现 .svn.zip 之类的假结果
+    assert not [u for u in urls if ".zip" in u or ".bak" in u], urls
+    print("  test_waf_dir_skips_its_backups OK")
+
+
+def test_waf_dir_without_flag_still_scans_backups():
+    """对照：没标 waf 的目录照常扫自身备份，别把功能一刀切死。"""
+    counter = []
+
+    class PlainHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path)
+            path = self.path.split("?")[0]
+            if path in ("/", "/svnrepo", "/svnrepo.zip"):
+                return self._send(200, b"ok")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(PlainHandler)
+    try:
+        res, err, st, out = run_scan(
+            url, ["svnrepo", "admin"], ["x"],
+            extra=["-t", "1", "-r", "1", "--timeout", "5"])
+    finally:
+        srv.shutdown()
+    bak = [p for p in counter if p.startswith("/svnrepo.")]
+    print("  svnrepo 自身备份请求:", bak)
+    assert "/svnrepo.zip" in bak, "未标 waf 的目录应照常扫备份: %s" % bak
+    print("  test_waf_dir_without_flag_still_scans_backups OK")
+
+
 def test_ka_no_reuse():
     """--ka 为负数时每个请求都不复用连接。"""
     counter = []
@@ -562,6 +661,8 @@ def main():
         ("后缀被放行则跳过", test_suffix_lied_about),
         ("--ir 规则", test_ignore_rules),
         ("--br 规则", test_bypass_rules),
+        ("waf 目录不扫自身备份", test_waf_dir_skips_its_backups),
+        ("未标 waf 目录照常扫备份", test_waf_dir_without_flag_still_scans_backups),
         ("--ka 不复用", test_ka_no_reuse),
     ]
     failed = []

@@ -707,8 +707,22 @@ class Engine(object):
 
         如 admin/web/ 存在 -> 探 admin/web.tar.gz、admin/web.zip 等，
         from 为 backup_suffix。--nb 关闭所有自动备份路径，这里直接跳过。
+
+        标注了 ``waf`` 的目录额外跳过：备份名带着同一个敏感串
+        （``.svn`` -> ``.svn.zip``、``.svn.bak``），照样会触发那条 WAF
+        规则。而 WAF 打回的 403 等状态码不在「不存在」之列，会被记成
+        命中，白扫一堆假结果还继续喂检测规则。该目录本身已计入结果，
+        少了备份不会漏掉它存在的证据。
+
+        判据是「条目标了 waf」而不是「已被拉黑」：waf 是阈值，要超过才
+        拉黑（``waf=1`` 得失败两次），第一次命中时名字还在白名单里，
+        按拉黑判断会漏掉。
         """
         if self.args.nb:
+            return
+        if task.waf:
+            self.debug("目录 %s 标注了 waf，跳过其备份 %s.*"
+                       % (task.path, task.name))
             return
         dirname = task.name
         if not dirname:
