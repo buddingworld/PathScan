@@ -136,7 +136,7 @@ class Worker(threading.Thread):
             engine.maybe_open_ok_dirs()
             return
 
-        # ---- 忽略规则：判定为 404，记入 Ignored Paths，不递归 ----
+        # ---- 忽略规则：判定为 404，不递归；只有目录会记入报告 ----
         rule = engine.ignore_rules.matched(resp._resp, resp.code, resp.size)
         if rule is not None:
             reason = "--ir %s %s" % (rule["attr"], rule["raw"])

@@ -260,6 +260,11 @@ def format_line(rec):
     return line
 
 
+def _dirs_only(entries):
+    """只留目录类条目：报告的可读性靠它，见 format_report 的说明。"""
+    return [e for e in entries if e.get("type") == "dir"]
+
+
 def _section(lines, title, entries, show_remark=False):
     """渲染报告里的一个小节。
 
@@ -291,19 +296,20 @@ def format_report(state, args):
         Result(OK):
             /xx2  [200] (1234)
 
+    两个小节都只列**目录**：目录代表「这里没继续往下扫」或「这里存在」，
+    是报告真正要传达的信息；文件和备份路径数量大且多为 404 噪声，
+    逐条列出会把报告刷爆，所以它们只在实时日志里留一行。
+
     Ignored Paths 里的条目本身就是被判为 404 的，所以不显示备注；
     备注只出现在 Result(OK) 里。
     """
     lines = []
     lines.append(args.url + "/")
-    _section(lines, "Ignored Paths", state.ignored)
-    _section(lines, "Result(OK)", state.results, show_remark=True)
+    _section(lines, "Ignored Paths", _dirs_only(state.ignored))
+    _section(lines, "Result(OK)", _dirs_only(state.results), show_remark=True)
     if state.errors:
         lines.append("")
-        _section(lines, "Errors", [
-            {"path": e["path"], "code": None, "size": None,
-             "remark": "tries=%d %s" % (e["trytimes"], e.get("reason", ""))}
-            for e in state.errors], show_remark=True)
+        _section(lines, "Errors", _dirs_only(state.errors), show_remark=True)
     return lines
 
 

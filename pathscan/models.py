@@ -740,7 +740,16 @@ class GlobalState(object):
             return True
 
     def add_ignored(self, task, url, code, size, location=None, reason=""):
-        """记录一条被视为 404 而忽略的路径（最终报告的 Ignored Paths）。"""
+        """记录一条被视为 404 而忽略的路径（最终报告里单列一节）。
+
+        只收**目录**：目录一旦被 --ir 判为 404，就不能再递归下去，
+        这个「为什么不往下扫」的结论必须留痕，否则整棵子树静默消失。
+        文件和备份路径被忽略是常态（软 404 服务器上遍地都是），逐个列出
+        既没有信息量又会把报告刷爆，所以它们不进这一节，与普通 404 一样
+        只体现在实时日志的一行 [err]，最终报告里完全不出现。
+        """
+        if task.type != "dir":
+            return
         with self.lock:
             self.ignored.append({
                 "path": task.path,

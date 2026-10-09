@@ -401,11 +401,16 @@ def test_suffix_lied_about():
 
 
 def test_ignore_rules():
+    """--ir 命中即等同 404：不进结果，也不会把报告刷爆。
+
+    目录被忽略要留痕（否则整棵子树静默消失），文件与备份路径被忽略
+    属于常态，跟普通 404 一样不记录、不出现在报告里。
+    """
     existing = {"/admin": (200, b"a" * 10), "/login": (200, b"b" * 99)}
     srv, url = start_server(make_handler(existing))
     try:
         res, err, st, out = run_scan(
-            url, ["admin", "login"], ["x"],
+            url, ["admin", "login"], ["index"],
             extra=["-t", "2", "-r", "1", "--timeout", "5",
                    "--ir", "size", "99"])
     finally:
@@ -414,7 +419,24 @@ def test_ignore_rules():
     print("  results:", urls)
     assert url + "/admin" in urls, urls
     assert url + "/login" not in urls, "--ir size 99 应把 login 判为 404"
+
+    report = "\n".join(output.format_report(st, _args_for(url)))
+    print("  --- 报告 ---")
+    for line in report.splitlines():
+        print("   |", line)
+    # 目录被忽略：留在报告的 Ignored Paths 里
+    assert "/login" in report, "被忽略的目录应留痕: %s" % report
+    # 文件 / 备份路径被忽略：报告里一条都不出现（当初一屏全是它们）
+    assert "/db.zip" not in report, "被忽略的备份路径不该进报告: %s" % report
+    assert "/index" not in report, "被忽略的文件不该进报告: %s" % report
     print("  test_ignore_rules OK")
+
+
+def _args_for(url):
+    """报告渲染只用到 args.url，测试里按目标拼一个即可。"""
+    ns = cli.build_parser().parse_args(
+        ["-u", url, "-d", "d.txt", "-f", "f.txt"])
+    return cli.Args(ns)
 
 
 def test_bypass_rules():

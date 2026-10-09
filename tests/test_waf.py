@@ -627,8 +627,8 @@ def test_remark_shown_only_on_non_404():
     st.add_result({"path": "admin", "url": "http://t/admin", "type": "dir",
                    "code": 200, "size": 10, "location": None,
                    "from": "common", "remark": "ZhiyuanOA", "depth": 1})
-    st.add_ignored(mk_task("ignored1"), "http://t/ignored1", 301, 0,
-                   "/x", "--ir test")
+    st.add_ignored(mk_task("ignored1", type_="dir"), "http://t/ignored1",
+                   301, 0, "/x", "--ir test")
     st.ignored[-1]["remark"] = "不该出现"
     report = "\n".join(output.format_report(st, mk_args()))
     print("  --- 报告 ---")
