@@ -66,7 +66,7 @@ class Resp(object):
     """一次请求的结果。``error`` 非 None 表示请求失败（网络层）。"""
 
     __slots__ = ("url", "code", "size", "location", "error", "elapsed",
-                 "_resp")
+                 "_resp", "ignored")
 
     def __init__(self, url):
         self.url = url
@@ -76,15 +76,24 @@ class Resp(object):
         self.error = None
         self.elapsed = 0.0
         self._resp = None
+        self.ignored = False
 
     @property
     def ok(self):
         return self.error is None
 
+    def mark_ignored(self):
+        """按 --ir 命中处理：该响应视为「路径不存在」。
+
+        探针据此按未命中结算——dircheck 判为未命中就是「随机路径不存在」，
+        扫描继续；后缀/备份探针判为未命中则该后缀照常扫。
+        """
+        self.ignored = True
+
     @property
     def exists(self):
-        """路径是否存在。请求失败或 404 类状态码都算不存在。"""
-        if self.error is not None:
+        """路径是否存在。请求失败、404 类状态码、被 --ir 判为 404 都算不存在。"""
+        if self.error is not None or self.ignored:
             return False
         return self.code not in NOT_FOUND_CODES
 
@@ -95,6 +104,42 @@ class Resp(object):
             return self._resp.text or ""
         except Exception:
             return ""
+
+    def key_info(self):
+        """响应包关键信息，一行展示：status_code / content_length 等。
+
+        用于终止时输出「关键请求」的响应细节，让用户能核对服务器到底回了
+        什么（真软 404 / WAF 拦截页 / 代理注入）。content_length 优先取
+        响应头原值；服务器没给（chunked、无该头）时标注为实测 body 字节数。
+        """
+        if self.error is not None:
+            return "请求失败: %s" % self.error
+        headers = getattr(self._resp, "headers", None)
+        parts = ["status_code=%s" % self.code]
+
+        cl = None
+        if headers is not None:
+            try:
+                cl = headers.get("Content-Length")
+            except Exception:
+                cl = None
+        if cl is not None:
+            parts.append("content_length=%s" % cl)
+        else:
+            parts.append("content_length=%s（无该响应头，实测 body 字节数）"
+                         % ("-" if self.size is None else self.size))
+
+        for header in ("Content-Type", "Server", "Location"):
+            value = None
+            if headers is not None:
+                try:
+                    value = headers.get(header)
+                except Exception:
+                    value = None
+            if value:
+                parts.append("%s=%s"
+                             % (header.lower().replace("-", "_"), value))
+        return "  ".join(parts)
 
     def __repr__(self):
         if self.error:
@@ -201,7 +246,13 @@ class Scanner(object):
 
     @staticmethod
     def _size_of(r):
-        """规格要求：优先 content-length，没有则取 len(response.body)。"""
+        """规格要求：优先 content-length，没有则取 len(response.body)。
+
+        回退值必须是 ``len(r.content)``——解压后的**字节数**，与
+        Content-Length 同口径；不能换成 ``len(r.text)``，那是按 charset
+        解码后的**字符数**，遇到中文等多字节内容会小一截，--ir size 与
+        终止提示里的 content_length 都会跟着算错。
+        """
         cl = r.headers.get("Content-Length")
         if cl is not None:
             try:

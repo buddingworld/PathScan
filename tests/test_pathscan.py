@@ -12,16 +12,19 @@
 """
 
 import os
+import re
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pathscan import cli, control, engine, output, rules  # noqa: E402
 from pathscan.models import GlobalState  # noqa: E402
+from pathscan.scanner import Scanner  # noqa: E402
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -200,7 +203,80 @@ def test_soft404_root_aborts():
     print("  printed:", [l for l in out if "软 404" in l or "终止" in l])
     assert st.stop_flag, "软 404 根目录应终止扫描"
     assert not res, "软 404 下不应有结果: %s" % res
+    # 终止时必须带出关键请求的响应包关键信息（status_code / content_length）
+    text = "\n".join(out)
+    assert "无法继续扫描，终止" in text, text
+    assert re.search(r"! 关键请求: \S+ \S+", text), text
+    assert "status_code=200" in text, text
+    assert re.search(r"content_length=\d+", text), text
     print("  test_soft404_root_aborts OK")
+
+
+def test_ir_applies_to_probes():
+    """--ir 命中时探针也必须按「未命中」结算。
+
+    场景：软 404 服务器统一回 200 + 固定长度的错误页，用户用 --ir size
+    把该长度声明为 404。此时 dircheck 探针返回的正是这种响应，必须判为
+    「随机路径不存在」——扫描继续，而不是识别成软 404 后终止。
+    """
+    counter = []
+    srv, url = start_server(make_handler({}, soft404=True, counter=counter))
+    try:
+        # 软 404 的响应体都很短（"soft404 " + 路径），10-100 覆盖全部
+        res, err, st, out = run_scan(
+            url, ["admin", "api"], ["login"],
+            extra=["-t", "2", "-r", "2", "--timeout", "5",
+                   "--ir", "size", "10-100"])
+    finally:
+        srv.shutdown()
+    text = "\n".join(out)
+    assert not st.stop_flag, "dircheck 被 --ir 忽略后不应终止: %s" % text
+    assert "无法继续扫描，终止" not in text, text
+    assert "/admin" in counter, "扫描应继续进行: %s" % counter[:20]
+    assert not res, res
+    print("  test_ir_applies_to_probes OK")
+
+
+def test_size_uses_bytes_not_chars():
+    """无 Content-Length 时，size 取 r.content 的字节数，不是 r.text 的字符数。
+
+    中文等多字节内容两者会差出倍数。--ir size 的匹配和终止提示里的
+    content_length 都走这个 size，必须与 Content-Length 同口径（解压后字节数）。
+    """
+    body = "汉字abc".encode("utf-8")        # 9 字节；"汉字abc" 只有 5 个字符
+
+    class NoLength(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()              # 故意不发 Content-Length，靠连接关闭定界
+            self.wfile.write(body)
+
+    srv, url = start_server(NoLength)
+    try:
+        args = SimpleNamespace(ti_range=(0.0, 0.0), thread=1, keep_alive=True,
+                               ka_limit=200, headers=None, proxy=None,
+                               timeout=5, method="get")
+        sc = Scanner(args)
+        try:
+            resp = sc.fetch(url + "/whatever")
+        finally:
+            sc.close()
+    finally:
+        srv.shutdown()
+
+    assert resp.error is None, resp
+    assert resp.code == 200, resp
+    assert resp.size == len(body), \
+        "size 应为字节数 %d，实际 %s" % (len(body), resp.size)
+    info = resp.key_info()
+    assert "content_length=%d" % len(body) in info, info
+    print("  test_size_uses_bytes_not_chars OK")
 
 
 def test_dead_suffix_skipped():
@@ -420,6 +496,8 @@ def main():
         ("掩码引擎", test_mask_engine),
         ("正常站点", test_normal_site),
         ("软 404 终止", test_soft404_root_aborts),
+        ("--ir 作用于探针", test_ir_applies_to_probes),
+        ("size 用字节数", test_size_uses_bytes_not_chars),
         ("后缀探测通过则照常扫", test_dead_suffix_skipped),
         ("后缀被放行则跳过", test_suffix_lied_about),
         ("--ir 规则", test_ignore_rules),

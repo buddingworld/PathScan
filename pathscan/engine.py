@@ -119,6 +119,13 @@ class Worker(threading.Thread):
         if self.is_probe(task):
             rule = engine.ignore_rules.matched(resp._resp, resp.code,
                                                resp.size)
+            # --ir 命中说明这个响应就是用户定义的「不存在」（典型场景：软 404
+            # 服务器统一回 200 + 固定长度的错误页）。探针必须按同一标准结算，
+            # 否则 --ir 对探针完全失效——根目录 dircheck 会照样判成软 404
+            # 并终止扫描，用户拿 --ir 也拦不住。
+            if rule is not None:
+                resp.mark_ignored()
+                engine.debug("探针 %s 被 --ir 判为 404，按未命中结算" % url)
             if task.from_ == "dircheck":
                 engine.on_dircheck_result(task, url, resp)
             elif task.from_ == "suffixcheck":
@@ -590,6 +597,12 @@ class Engine(object):
                 self.printer.raw("!")
                 self.printer.raw("! 根目录探测命中：目标对任意路径都返回 %s"
                                  % resp.code)
+                # 终止前把触发终止的这次请求（关键请求）的响应关键信息打出来：
+                # 只有「终止」没有证据，用户无法判断服务器到底回了什么
+                # （真软 404 / WAF 拦截页 / 代理注入），也就无从排查。
+                self.printer.raw("! 关键请求: %s %s"
+                                 % (self.args.method.upper(), resp.url))
+                self.printer.raw("! 响应关键信息: %s" % resp.key_info())
                 self.printer.raw("! 无法继续扫描，终止。")
                 self.printer.raw("!")
                 state.stop_flag = True
