@@ -53,6 +53,7 @@ preview
 0x
 0y
 0z
+uploadFile
 1
 10
 11
