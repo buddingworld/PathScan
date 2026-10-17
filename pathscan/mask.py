@@ -90,9 +90,10 @@ def resolve_charset(spec, custom, _guard=None):
                 continue
             if key.isdigit() and key != "0":
                 if key not in custom:
-                    raise MaskError("字符集 ?%s 未定义（需要 -%s）" % (key, key))
+                    raise MaskError("charset ?%s is not defined (use -%s)"
+                                    % (key, key))
                 if key in _guard:
-                    raise MaskError("字符集 ?%s 循环引用" % key)
+                    raise MaskError("charset ?%s is defined recursively" % key)
                 out.append(resolve_charset(custom[key], custom, _guard | {key}))
                 i += 2
                 continue
@@ -122,9 +123,9 @@ def _expand_group(body, connectors):
         items = split_top_level(items_s)
         items = [x for x in items if x != ""]
         if size <= 0:
-            raise MaskError("组合数量必须为正: {%s}" % body)
+            raise MaskError("combination count must be positive: {%s}" % body)
         if not items:
-            raise MaskError("组合内容为空: {%s}" % body)
+            raise MaskError("combination is empty: {%s}" % body)
         if kind == "C":
             combos = itertools.combinations(items, size)
         else:
@@ -134,7 +135,7 @@ def _expand_group(body, connectors):
     # {dev,test,prd} —— 任取一个，不用连接符
     items = [x for x in split_top_level(body) if x != ""]
     if not items:
-        raise MaskError("组合内容为空: {%s}" % body)
+        raise MaskError("combination is empty: {%s}" % body)
     return _dedupe_list(items)
 
 
@@ -167,7 +168,8 @@ def _tokenize(pattern, custom, connectors):
                 continue
             if key.isdigit() and key != "0":
                 if key not in custom:
-                    raise MaskError("字符集 ?%s 未定义（需要 -%s）" % (key, key))
+                    raise MaskError("charset ?%s is not defined (use -%s)"
+                                    % (key, key))
                 tokens.append(list(resolve_charset(custom[key], custom, {key})))
                 i += 2
                 continue
@@ -177,7 +179,7 @@ def _tokenize(pattern, custom, connectors):
         if ch == "{":
             end = pattern.find("}", i + 1)
             if end < 0:
-                raise MaskError("花括号未闭合: %s" % pattern)
+                raise MaskError("unclosed brace: %s" % pattern)
             if lit:
                 tokens.append(["".join(lit)])
                 lit = []
@@ -211,7 +213,8 @@ def expand_mask(pattern, custom=None, connectors=None, limit=DEFAULT_LIMIT):
         total *= len(tok)
         if total > limit:
             raise MaskError(
-                "掩码 %s 展开超过 %d 条，请收紧范围" % (pattern, limit))
+                "mask %s expands to more than %d entries, narrow the range"
+                % (pattern, limit))
     out = []
     for combo in itertools.product(*tokens):
         out.append("".join(combo))
@@ -291,21 +294,21 @@ def _selftest():
     # 上限保护
     try:
         expand_mask("?a?a?a?a", limit=10)
-        raise AssertionError("应该触发上限保护")
+        raise AssertionError("expansion limit should have triggered")
     except MaskError:
         pass
 
     # 未定义字符集
     try:
         expand_mask("?5")
-        raise AssertionError("应该报未定义")
+        raise AssertionError("undefined charset should have raised")
     except MaskError:
         pass
 
     # 循环引用
     try:
         expand_mask("?1", {"1": "?1"})
-        raise AssertionError("应该报循环引用")
+        raise AssertionError("recursive charset should have raised")
     except MaskError:
         pass
 

@@ -113,7 +113,7 @@ class Resp(object):
         响应头原值；服务器没给（chunked、无该头）时标注为实测 body 字节数。
         """
         if self.error is not None:
-            return "请求失败: %s" % self.error
+            return "request failed: %s" % self.error
         headers = getattr(self._resp, "headers", None)
         parts = ["status_code=%s" % self.code]
 
@@ -126,7 +126,7 @@ class Resp(object):
         if cl is not None:
             parts.append("content_length=%s" % cl)
         else:
-            parts.append("content_length=%s（无该响应头，实测 body 字节数）"
+            parts.append("content_length=%s (no header, measured body bytes)"
                          % ("-" if self.size is None else self.size))
 
         for header in ("Content-Type", "Server", "Location"):

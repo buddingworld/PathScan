@@ -281,15 +281,14 @@ def test_dead_dir_skips_its_probes():
     text = "\n".join(out)
     print("  dead_dirs:", st.dead_dirs)
     assert "Login/error" in st.dead_dirs, text
-    assert "Login/error 判定为软 404" in text, text
+    assert "dir Login/error is a soft 404" in text, text
 
     # 该目录下只应有 dircheck 那一次随机名请求，探针一条都不该再发
     under = [p for p in counter if p.startswith("/Login/error/")]
     print("  /Login/error/ 下的请求:", under)
     assert len(under) == 1, "软 404 后不该继续扫该目录: %s" % under
     # 也没有相应的假结论外泄
-    assert "备份探针 Login/error" not in text, text
-    assert "后缀 .php 在 Login/error" not in text, text
+    assert "suffix .php" not in text, text
     print("  test_dead_dir_skips_its_probes OK")
 
 
@@ -354,7 +353,7 @@ def test_soft404_dir_withdraws_its_results():
     head, _, tail = report.partition("Result(OK):")
     assert "/Static/fonts/zz" in head, "撤回的目录应转入 Ignored Paths: %s" % report
     assert "/Static/fonts/zz" not in tail, "它不该再出现在 Result(OK): %s" % report
-    assert "撤回 1 条结果" in text, text
+    assert "withdrew 1 result(s)" in text, text
     print("  test_soft404_dir_withdraws_its_results OK")
 
 
@@ -371,8 +370,8 @@ def test_soft404_root_aborts():
     assert not res, "软 404 下不应有结果: %s" % res
     # 终止时必须带出关键请求的响应包关键信息（status_code / content_length）
     text = "\n".join(out)
-    assert "无法继续扫描，终止" in text, text
-    assert re.search(r"! 关键请求: \S+ \S+", text), text
+    assert "cannot continue, stopping." in text, text
+    assert re.search(r"! key request: \S+ \S+", text), text
     assert "status_code=200" in text, text
     assert re.search(r"content_length=\d+", text), text
     print("  test_soft404_root_aborts OK")
@@ -397,7 +396,7 @@ def test_ir_applies_to_probes():
         srv.shutdown()
     text = "\n".join(out)
     assert not st.stop_flag, "dircheck 被 --ir 忽略后不应终止: %s" % text
-    assert "无法继续扫描，终止" not in text, text
+    assert "cannot continue, stopping." not in text, text
     assert "/admin" in counter, "扫描应继续进行: %s" % counter[:20]
     assert not res, res
     # 这种站点上几乎每个路径都命中规则：报告里一条都不该出现

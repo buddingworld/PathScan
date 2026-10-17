@@ -189,7 +189,7 @@ def test_controller_dispatch():
 
     # status
     assert ctl.dispatch(control.parse_command("status")) is None
-    assert "状态" in printer.text(), printer.text()
+    assert "state:" in printer.text(), printer.text()
 
     # rp
     st.add_result({"path": "admin_1", "url": "http://x/admin_1", "type": "dir",
@@ -207,7 +207,7 @@ def test_controller_dispatch():
 
     # at 正数：起线程（engine 为 None 时应提示而不是崩）
     ctl.dispatch(control.parse_command("at 2"))
-    assert "引擎未就绪" in printer.text(), printer.text()
+    assert "engine not ready" in printer.text(), printer.text()
 
     # pause 保持暂停
     assert ctl.dispatch(control.parse_command("pause")) is None

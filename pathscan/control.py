@@ -23,28 +23,29 @@ COMMANDS = ("rp", "at", "status", "exec", "go", "pause", "stop", "help", "?",
             "ed", "cs", "od")
 
 _HELP = """
-可用指令:
-  rp <path>      移除已存在的结果（前缀匹配，如 rp admin_x 清掉 admin_*）
-  at <n>         增加 n 个线程；n 为负数表示减少
-  ed <dirs>      追加额外目录，逗号分隔（如 ed dir1,dir2）。
-                 已扫过的目录也会补上这些子目录；不影响已有结果
-  cs <0|1>       设置大小写敏感：1=敏感，0=不敏感
-  od <dir>       追加已知存在的目录（如 od dir1/dir2/dir3）。
-                 逐层检查，缺的层补上并认定为存在、参与递归
-  status         显示当前扫描状态
-  exec <code>    临时执行代码，如 exec test_list.add(123)
-  go             继续扫描
-  pause          保持暂停
-  stop           终止扫描
-  help           显示本帮助
+commands:
+  rp <path>      drop results matching a prefix (rp admin_x clears admin_*)
+  at <n>         add n threads; a negative n removes threads
+  ed <dirs>      append extra directories, comma separated (ed dir1,dir2).
+                 Already scanned directories get them too; existing results
+                 are untouched
+  cs <0|1>       case sensitivity: 1=on, 0=off
+  od <dir>       append directories known to exist (od dir1/dir2/dir3).
+                 Missing levels are added and treated as existing, recursed
+  status         show current scan status
+  exec <code>    run code, e.g. exec test_list.add(123)
+  go             resume scanning
+  pause          stay paused
+  stop           stop scanning
+  help           show this help
 """.strip()
 
 
 def _human_wait(seconds):
     """把秒数说成人话：30 分钟 / 90 秒。"""
     if seconds >= 60:
-        return "%.0f 分钟" % (seconds / 60.0)
-    return "%.0f 秒" % seconds
+        return "%.0f min" % (seconds / 60.0)
+    return "%.0f s" % seconds
 
 
 # 连续空闲多久算扫描真正结束。工作线程在没活时不退出（暂停期间的
@@ -91,42 +92,43 @@ def parse_command(line):
         return Command("stop", raw=line)
     if name == "rp":
         if not arg:
-            return Command("rp", raw=line, error="rp 需要一个路径前缀")
+            return Command("rp", raw=line, error="rp needs a path prefix")
         return Command("rp", arg=arg, raw=line)
     if name == "at":
         if not arg:
-            return Command("at", raw=line, error="at 需要一个线程数")
+            return Command("at", raw=line, error="at needs a thread count")
         try:
             return Command("at", arg=int(arg), raw=line)
         except ValueError:
-            return Command("at", raw=line, error="at 的参数必须是整数")
+            return Command("at", raw=line, error="at takes an integer")
     if name == "exec":
         if not arg:
-            return Command("exec", raw=line, error="exec 需要一段代码")
+            return Command("exec", raw=line, error="exec needs some code")
         return Command("exec", arg=arg, raw=line)
     if name == "ed":
         if not arg:
-            return Command("ed", raw=line, error="ed 需要至少一个目录名")
+            return Command("ed", raw=line, error="ed needs at least one name")
         dirs = [d.strip().strip("/") for d in arg.split(",")]
         dirs = [d for d in dirs if d]
         if not dirs:
-            return Command("ed", raw=line, error="ed 的目录名不能为空")
+            return Command("ed", raw=line, error="ed names must not be empty")
         return Command("ed", arg=dirs, raw=line)
     if name == "cs":
         if not arg:
-            return Command("cs", raw=line, error="cs 需要 0 或 1")
+            return Command("cs", raw=line, error="cs needs 0 or 1")
         if arg not in ("0", "1"):
-            return Command("cs", raw=line, error="cs 只接受 0 或 1，收到 %r" % arg)
+            return Command("cs", raw=line,
+                           error="cs only takes 0 or 1, got %r" % arg)
         return Command("cs", arg=int(arg), raw=line)
     if name == "od":
         if not arg:
-            return Command("od", raw=line, error="od 需要一个目录路径")
+            return Command("od", raw=line, error="od needs a directory path")
         text = arg.strip().strip("/")
         if not text:
-            return Command("od", raw=line, error="od 的路径不能为空")
+            return Command("od", raw=line, error="od path must not be empty")
         return Command("od", arg=text, raw=line)
     return Command("unknown", arg=line, raw=line,
-                   error="未知指令 %r，输入 help 查看帮助" % name)
+                   error="unknown command %r, type help" % name)
 
 
 class Controller(object):
@@ -161,7 +163,7 @@ class Controller(object):
         self.printer.suspend_live()
         if not state.pause_event.is_set():
             # 已经在暂停中，用户又按了一次 —— 直接走
-            self.printer.raw("* 再次中断，直接退出")
+            self.printer.raw("* interrupted again, exiting")
             state.stop_flag = True
             with state.lock:
                 state.cond.notify_all()
@@ -169,7 +171,7 @@ class Controller(object):
         state.pause_requested = True
         state.pause_event.clear()
         self.printer.raw("=" * 66)
-        self.printer.raw("* 已暂停。输入指令继续（help 查看可用指令）")
+        self.printer.raw("* paused. Type a command to continue (help for list)")
         self.printer.raw("=" * 66)
 
     # ------------------------------------------------------------------
@@ -189,9 +191,9 @@ class Controller(object):
         state.pause_requested = False
         self.printer.suspend_live()
         self.printer.raw("=" * 66)
-        self.printer.raw("* WAF 拦截等待模式：疑似被拦截，已暂停扫描")
-        self.printer.raw("* %s 内无按键将自动恢复；输入指令可手动处理"
-                         % _human_wait(idle))
+        self.printer.raw("* WAF wait mode: likely blocked, scan paused")
+        self.printer.raw("* auto-resume in %s without a keypress; type a "
+                         "command to handle it" % _human_wait(idle))
         self.printer.raw("=" * 66)
         try:
             got_key = self._wait_for_key(idle)
@@ -202,11 +204,12 @@ class Controller(object):
             return
         if got_key:
             # 有人操作：交给 REPL，由用户决定 go / stop
-            self.printer.raw("* 检测到输入，进入指令模式")
+            self.printer.raw("* keypress detected, entering command mode")
             self.repl()
             return
         # 无人值守：自动恢复
-        self.printer.info("无人值守 %s，自动恢复扫描" % _human_wait(idle), tag="*")
+        self.printer.info("no input for %s, resuming automatically"
+                          % _human_wait(idle), tag="*")
         state.pause_requested = False
         state.pause_event.set()
         self.printer.resume_live()
@@ -266,7 +269,7 @@ class Controller(object):
                 line = self._readline()
             except (EOFError, KeyboardInterrupt):
                 self.printer.raw("")
-                self.printer.raw("* 输入结束，终止扫描")
+                self.printer.raw("* input closed, stopping scan")
                 return False
             cmd = parse_command(line)
             if cmd.error:
@@ -306,21 +309,22 @@ class Controller(object):
             with state.lock:
                 state.cond.notify_all()
             self.printer.resume_live()
-            self.printer.raw("* 继续扫描")
+            self.printer.raw("* resuming")
             return True
         if name == "pause":
-            self.printer.raw("* 保持暂停")
+            self.printer.raw("* staying paused")
             return None
         if name == "stop":
             state.stop_flag = True
             state.pause_event.set()
             with state.lock:
                 state.cond.notify_all()
-            self.printer.raw("* 终止扫描")
+            self.printer.raw("* stopping")
             return False
         if name == "rp":
             n = state.suppress(cmd.arg)
-            self.printer.raw("* 已移除 %d 条匹配 %r 的结果" % (n, cmd.arg))
+            self.printer.raw("* removed %d result(s) matching %r"
+                             % (n, cmd.arg))
             return None
         if name == "at":
             self.adjust_threads(cmd.arg)
@@ -337,7 +341,7 @@ class Controller(object):
         if name == "od":
             self.append_ok_dirs(cmd.arg)
             return None
-        self.printer.raw("! 未知指令，输入 help 查看帮助")
+        self.printer.raw("! unknown command, type help")
         return None
 
     # ------------------------------------------------------------------
@@ -366,22 +370,22 @@ class Controller(object):
         不影响已有结果，也不重置扫描；新任务按正常流程探测与递归。
         """
         if self.engine is None:
-            self.printer.raw("! 引擎未就绪，无法追加目录")
+            self.printer.raw("! engine not ready, cannot add directories")
             return
         dirs = self.known_dirs()
         added = 0
         for base in dirs:
             for name in names:
                 added += self.engine.queue_dir(base, name)
-        self.printer.raw("* ed 已追加 %d 个目录任务（覆盖 %d 个已存在目录 × %d 个名字）"
+        self.printer.raw("* ed queued %d task(s) (%d existing dirs x %d names)"
                          % (added, len(dirs), len(names)))
 
     def set_case_sensitive(self, value):
         """cs 指令：切换大小写敏感。"""
         self.args.cs = value
         self.state.case_sensitive = bool(value)
-        self.printer.raw("* 大小写敏感已设为 %d（%s）"
-                         % (value, "敏感" if value else "不敏感"))
+        self.printer.raw("* case sensitivity set to %d (%s)"
+                         % (value, "on" if value else "off"))
 
     def append_ok_dirs(self, path):
         """od 指令：追加已知存在的目录，逐层补齐并参与递归。
@@ -390,7 +394,7 @@ class Controller(object):
         每层若尚未被认定存在，就补上并直接认定为非 404、加入递归检测。
         """
         if self.engine is None:
-            self.printer.raw("! 引擎未就绪，无法追加目录")
+            self.printer.raw("! engine not ready, cannot add directories")
             return
         levels = []
         parts = [p for p in path.split("/") if p]
@@ -400,7 +404,7 @@ class Controller(object):
         for level in levels:
             if self.engine.add_ok_dir(level):
                 added += 1
-        self.printer.raw("* od 已处理 %d 层（新增 %d），路径 %s"
+        self.printer.raw("* od handled %d level(s) (%d new), path %s"
                          % (len(levels), added, "/".join(parts)))
 
     # ------------------------------------------------------------------
@@ -409,7 +413,7 @@ class Controller(object):
         state = self.state
         if delta > 0:
             if self.engine is None:
-                self.printer.raw("! 引擎未就绪，无法调整线程")
+                self.printer.raw("! engine not ready, cannot adjust threads")
                 return
             from .engine import Worker
             with state.lock:
@@ -419,7 +423,7 @@ class Controller(object):
                 w = Worker(self.engine, base + i)
                 self.engine.workers.append(w)
                 w.start()
-            self.printer.raw("* 线程数 +%d，当前目标 %d"
+            self.printer.raw("* threads +%d, target now %d"
                              % (delta, state.target_threads))
         elif delta < 0:
             n = -delta
@@ -435,19 +439,20 @@ class Controller(object):
             with state.lock:
                 state.target_threads = max(1, state.target_threads - n)
                 state.cond.notify_all()
-            self.printer.raw("* 已通知 %d 个线程退出，当前目标 %d"
+            self.printer.raw("* asked %d thread(s) to exit, target now %d"
                              % (retired, state.target_threads))
         else:
-            self.printer.raw("* 线程数未变化")
+            self.printer.raw("* thread count unchanged")
 
     def run_code(self, code):
         """执行 exec 指令的代码片段。"""
         try:
             exec(compile(code, "<exec>", "exec"), self.namespace)
         except Exception as exc:
-            self.printer.raw("! exec 失败: %s: %s" % (type(exc).__name__, exc))
+            self.printer.raw("! exec failed: %s: %s"
+                             % (type(exc).__name__, exc))
             return
-        self.printer.raw("* 执行完成")
+        self.printer.raw("* done")
 
     # ------------------------------------------------------------------
     def _queue_breakdown(self):
@@ -469,23 +474,24 @@ class Controller(object):
         fails = self.state.thread_fails
         busy = [t for t, n in fails.items() if n]
         self.printer.raw("-" * 66)
-        self.printer.raw(" 状态: %s" % ("已暂停" if not self.state.pause_event.is_set()
-                                        else "运行中"))
-        self.printer.raw(" 已完成 %d  队列 %d%s  进行中 %d"
+        self.printer.raw(" state: %s" % ("paused" if not self.state.pause_event.is_set()
+                                         else "running"))
+        self.printer.raw(" done %d  queued %d%s  active %d"
                          % (snap["done"], snap["queued"],
                             self._queue_breakdown(), snap["active"]))
-        self.printer.raw(" 结果 %d  忽略 %d  失败 %d  死目录 %d"
+        self.printer.raw(" results %d  ignored %d  errors %d  dead dirs %d"
                          % (snap["results"], snap["ignored"], snap["errors"],
                             snap["dead_dirs"]))
-        self.printer.raw(" 线程 %d/%d  耗时 %.1fs  均速 %.1f req/s  实时 %.1f req/s"
+        self.printer.raw(" threads %d/%d  elapsed %.1fs  avg %.1f req/s  "
+                         "now %.1f req/s"
                          % (snap["threads_alive"], snap["target_threads"],
                             snap["elapsed"], rate, speed))
         if busy:
-            self.printer.raw(" 连续失败中的线程: %s"
+            self.printer.raw(" threads with failures: %s"
                              % ", ".join("#%d=%d" % (t, n)
                                          for t, n in sorted(busy.items())))
         if self.state.waf_ignored:
-            self.printer.raw(" WAF 忽略的名称: %s"
+            self.printer.raw(" WAF ignored names: %s"
                              % ", ".join(self.state.waf_ignored))
         self.printer.raw("-" * 66)
 

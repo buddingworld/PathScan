@@ -33,18 +33,21 @@ class IgnoreRules(object):
         for attr, value in pairs:
             if attr not in IR_ATTRS:
                 raise RuleError(
-                    "--ir 的属性必须是 %s 之一，收到 %r" % ("/".join(IR_ATTRS), attr))
+                    "--ir attribute must be one of %s, got %r"
+                    % ("/".join(IR_ATTRS), attr))
             rule = {"attr": attr, "raw": value}
             if attr in ("code", "size"):
                 try:
                     rule["lo"], rule["hi"] = _parse_int_or_range(value)
                 except ValueError:
-                    raise RuleError("--ir %s 需要整数或区间，收到 %r" % (attr, value))
+                    raise RuleError("--ir %s expects an integer or a range, "
+                                    "got %r" % (attr, value))
             else:
                 try:
                     rule["re"] = re.compile(value)
                 except re.error as exc:
-                    raise RuleError("--ir %s 正则无效: %s" % (attr, exc))
+                    raise RuleError("--ir %s has an invalid regex: %s"
+                                    % (attr, exc))
             self.rules.append(rule)
 
     def __len__(self):
@@ -113,7 +116,7 @@ class BypassRules(object):
             if attr not in BR_ATTRS:
                 attr = "name"
             if value == "":
-                raise RuleError("--br 的值不能为空")
+                raise RuleError("--br value must not be empty")
             self.rules.append((attr, value))
 
     def __len__(self):

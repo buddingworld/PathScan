@@ -52,8 +52,8 @@ def main(argv=None):
 
     for bad in (bad1, bad2, bad3):
         for lineno, text in bad:
-            printer.info("备注不是合法 JSON（第 %d 行），按纯文本保留: %s"
-                         % (lineno, text), tag="!")
+            printer.info("line %d: remark is not valid JSON, kept as plain "
+                         "text: %s" % (lineno, text), tag="!")
 
     # ---- 规则 ----
     try:
@@ -112,8 +112,8 @@ def main(argv=None):
     printer.finish_live()
     snap = state.snapshot()
     printer.raw("")
-    printer.raw("* 扫描结束%s，已完成 %d，耗时 %.1fs"
-                % ("（被终止）" if not finished else "", snap["done"],
+    printer.raw("* scan finished%s, %d done, %.1fs"
+                % (" (stopped)" if not finished else "", snap["done"],
                    snap["elapsed"]))
     printer.raw("")
     output.print_report(state, args, printer)
@@ -121,9 +121,9 @@ def main(argv=None):
     if args.of:
         ok, err = output.write_output(args.of, state, args)
         if ok:
-            printer.info("结果已写入 %s" % args.of)
+            printer.info("results written to %s" % args.of)
         else:
-            printer.raw("! 写文件失败: %s" % err)
+            printer.raw("! cannot write output file: %s" % err)
             return 1
 
     return 0

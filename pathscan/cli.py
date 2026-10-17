@@ -23,7 +23,8 @@ CS_INDICES = range(1, 10)
 _IR_ATTRS = "code | size | grep | text | location"
 _BR_ATTRS = "name | path | url"
 
-_CS_HELP = "--cs1 ~ --cs9: 自定义字符集 ?1~?9，各自独立，可嵌套 ?l?d。如 --cs1 ?l?d"
+_CS_HELP = ("--cs1 ~ --cs9: custom charsets ?1~?9, independent, can nest "
+            "?l?d. e.g. --cs1 ?l?d")
 
 # 常见场景的现成命令，参数缺失/出错时和 --help 都会打印
 DEMOS = [
@@ -46,104 +47,108 @@ def format_demos():
     return "\n".join(lines)
 
 _EPILOG = """
-参数说明与示例
+Options and examples
 ==================================================================
--u  目标 url。不带 scheme 时自动补 http://
+-u  target url. http:// is added when the scheme is missing
        -u http://target.com        -u 192.168.1.1:8080
 
--t  -r  线程数与递归层数。层数按 parent 里的 / 数量计算
+-t  -r  threads and recursion depth. Depth counts / in parent
        -t 20 -r 3
 
--m  请求方法。目录扫描用 head 最快，被拦时换 get
+-m  request method. head is fastest for directory scanning; switch to get
+    when it gets blocked
        -m head        -m get
 
--d  -f  目录/文件词表，两行格式相同，二者都必需
-       名称[#备注]，备注是 JSON
+-d  -f  directory / file wordlists, same line format, both required
+       name[#remark], remark is JSON
        d.txt:  admin
                backup#{"waf":3}
        -d d.txt -f f.txt
 
---files  带后缀的文件词表（无需再配 -s）
+--files  file wordlist that already carries suffixes (no -s needed)
        --files f_ext.txt
 
--s  文件后缀，逗号分隔。同时用于后缀探测：后缀不可信时该目录跳过它
+-s  file suffixes, comma separated. Also used for suffix probing: the whole
+    directory skips a suffix once it is proven untrustworthy
        -s .php,.aspx,.jsp
 
---file-pre  给文件名加前缀，与 -s 组合展开
+--file-pre  prefix file names, expanded together with -s
        --file-pre "old_,new_" -s .php     -> old_x.php new_x.php ...
 
---ed --ef  额外目录/文件，支持掩码
-       --ed "admin_new,admin2"           直接列名字
+--ed --ef  extra directories / files, mask syntax supported
+       --ed "admin_new,admin2"           plain names
        --ed "admin?d"                    admin0..admin9
-       --ed "{C-2:dev,test}"             devtest（组合，顺序无关）
-       --ed "{P-2:dev,test}"             devtest testdev（排列）
-       --ed "{dev,test,prd}"             三选一
-       --ed "?u?l" --cs1 "0123456789"    自定义字符集
+       --ed "{C-2:dev,test}"             devtest (combination, order free)
+       --ed "{P-2:dev,test}"             devtest testdev (permutation)
+       --ed "{dev,test,prd}"             pick one of three
+       --ed "?u?l" --cs1 "0123456789"    custom charset
 
---csc  组合扩展的连接字符，空串总是隐含包含
+--csc  connector characters for combinations; the empty string is implicit
        --ed "{C-2:dev,test}" --csc ",_,-"
               -> devtest dev_test dev-test
 
---rh  请求头，可多次
+--rh  request headers, repeatable
        --rh "Cookie: a=b" --rh "X-Forwarded-For: 127.0.0.1"
 
---mode  1=目录补尾斜杠(admin/)  2=目录不补(admin)  默认 2
+--mode  1=directories get a trailing slash (admin/)  2=no slash (admin),
+       default 2
        --mode 1
 
---cs  大小写敏感。开时 Admin 与 admin 都扫；关时只扫其中一个
+--cs  case sensitivity. On: both Admin and admin are scanned; off: only one
        --cs 1        --cs 0
 
---ti  线程内请求间隔，可用区间表示随机
+--ti  per-thread delay between requests, a range means random
        --ti 0.5      --ti 1-3
 
---ir  把匹配的响应判定为 404，与普通 404 完全一致：不记录结果、
-      不递归、不进最终报告，只在实时日志里留一行 [err]。
-      可多次，属性：%s
-       --ir size 1234            固定长度
-       --ir code 500-599         状态码区间
-       --ir grep "not found"     响应体正则
-       --ir text "Error"         响应体文本
-       --ir location /login      跳转目标
+--ir  treat matching responses as 404, exactly like a real 404: no result,
+       no recursion, not in the final report - only a live log line.
+       Repeatable, attributes: %s
+       --ir size 1234            exact length
+       --ir code 500-599         status code range
+       --ir grep "not found"     body regex
+       --ir text "Error"         body text
+       --ir location /login      redirect target
 
---br  路径命中则不入队。可多次，属性：%s
-       --br name logout          名称含 logout
-       --br path /static/        路径含 /static/
+--br  paths matching are never queued. Repeatable, attributes: %s
+       --br name logout          name contains logout
+       --br path /static/        path contains /static/
 
---nb  不自动添加备份路径（备份文件、目录自身备份）
+--nb  no automatic backup paths (backup files, directory self backups)
        --nb
-       注：词表里标注了 waf 的目录，其自身备份始终跳过（备份名带着
-       同一个敏感串，扫了只会触发同一条 WAF 规则）
+       Note: directories marked with waf in the wordlist always skip their
+       self backups - the name carries the same sensitive string.
 
---od  已确认存在的目录，逐层登记并参与递归
+--od  directories known to exist, registered level by level
        --od dir1/dir2/dir3/
-       每层只发一次 dircheck：伪 404 的层不展开它的词表子目录，
-       但链继续往下走（dir1 是假的也不影响 dir2、dir3）
+       Each level gets one dircheck: a fake 404 level does not expand its
+       wordlist children, but the chain continues (a fake dir1 does not
+       stop dir2 or dir3).
 
---proxy  代理
+--proxy  proxy
        --proxy http://127.0.0.1:8081
        --proxy socks5h://127.0.0.1:1080
 
---ka  keep-alive 复用次数
-       --ka 0        无限复用
-       --ka 200      复用 200 次后重连（默认）
-       --ka -1       不复用，每个请求新建连接
+--ka  keep-alive reuse count
+       --ka 0        reuse forever
+       --ka 200      reconnect after 200 reuses (default)
+       --ka -1       no reuse, new connection per request
 
---rt  --timeout  失败重试次数与单次超时
+--rt  --timeout  retry limit and per-request timeout
        --rt 3 --timeout 5
 
---of  结果导出路径（文本，含 Ignored Paths 与 Result）
+--of  export path (text, contains Ignored Paths and Result)
        --of out.txt
 
---cq  安静模式，不输出实时日志
+--cq  quiet mode, no live log
        --cq
 
-完整的用法示例
+Full example
        python pathscan.py -u http://target.com -d d.txt -f f.txt \\
               -s .php,.html -t 20 -r 3 --ed "admin?d"
 ==================================================================
 %s
 ==================================================================
-扫描中按 Ctrl+C 暂停，可用指令: rp / at / status / exec / go / pause / stop
+Ctrl+C pauses the scan; commands: rp / at / status / exec / go / pause / stop
 """ % (_IR_ATTRS, _BR_ATTRS, format_demos())
 
 
@@ -179,93 +184,99 @@ class DemoArgumentParser(argparse.ArgumentParser):
 def build_parser():
     p = DemoArgumentParser(
         prog="pathscan",
-        description="PathScan %s - 递归型 Web 目录/文件扫描器" % VERSION,
+        description="PathScan %s - recursive web directory/file scanner" % VERSION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_EPILOG,
     )
     p.add_argument("-u", "--url", required=True, metavar="URL",
-                   help="目标 url")
+                   help="target url")
     p.add_argument("-t", "--thread", type=int, default=3, metavar="N",
-                   help="扫描线程数 (默认 3)")
+                   help="worker threads (default 3)")
     p.add_argument("-m", "--method", default="head", metavar="M",
                    choices=METHODS,
-                   help="请求方法: %s (默认 head)" % "|".join(METHODS))
+                   help="request method: %s (default head)" % "|".join(METHODS))
     p.add_argument("-r", "--recursion", type=int, default=5, metavar="N",
-                   help="递归最大层数 (默认 5)")
+                   help="max recursion depth (default 5)")
 
-    g = p.add_argument_group("词表")
+    g = p.add_argument_group("wordlists")
     g.add_argument("-d", "--dir", required=True, metavar="FILE",
-                   help="目录词表，每行 name[#json备注]")
+                   help="directory wordlist, one name[#json remark] per line")
     g.add_argument("-f", "--file", required=True, metavar="FILE",
-                   help="文件名词表，不含后缀，每行 name[#json备注]")
+                   help="file name wordlist, no suffixes, name[#json remark]")
     g.add_argument("--files", metavar="FILE",
-                   help="带后缀的文件词表")
+                   help="file wordlist that already carries suffixes")
     g.add_argument("-s", "--suffix", metavar="LIST",
-                   help="文件后缀，逗号分隔，如 .php,.aspx。同时用于后缀探测")
+                   help="file suffixes, comma separated, e.g. .php,.aspx. "
+                        "Also drives suffix probing")
     g.add_argument("--file-pre", dest="file_pre", metavar="LIST",
-                   help="文件前缀，逗号分隔，如 old_,new_")
+                   help="file name prefixes, comma separated, e.g. old_,new_")
 
-    g = p.add_argument_group("掩码扩展")
+    g = p.add_argument_group("mask expansion")
     g.add_argument("--ed", metavar="MASK",
-                   help="额外目录，支持 hashcat 掩码与 {C-2:}/{P-2:} 扩展")
-    g.add_argument("--ef", metavar="MASK", help="额外文件，语法同 --ed")
+                   help="extra directories, hashcat masks and {C-2:}/{P-2:} "
+                        "supported")
+    g.add_argument("--ef", metavar="MASK", help="extra files, same syntax")
     g.add_argument("--csc", "--custom-charset-connect", dest="csc",
                    metavar="LIST",
-                   help="组合扩展的连接字符，逗号分隔，如 \",_,-\"")
+                   help="connector characters for combinations, e.g. \",_,-\"")
     # --cs1 ~ --cs9 是 9 个各自独立的字符集，但帮助里只占一行：
     # 只有 --cs1 显示说明，其余用 SUPPRESS 隐藏，避免参数列表被撑散。
     for i in CS_INDICES:
         g.add_argument("--cs%d" % i, dest="cs%d" % i, metavar="SET",
                        help=(_CS_HELP if i == 1 else argparse.SUPPRESS))
 
-    g = p.add_argument_group("请求")
+    g = p.add_argument_group("request")
     g.add_argument("--rh", "--request-headers", dest="rh", action="append",
-                   metavar="H", help='请求头，可多次，如 --rh "Cookie: a=b"')
+                   metavar="H", help='request header, repeatable, '
+                                     'e.g. --rh "Cookie: a=b"')
     g.add_argument("--proxy", metavar="URL",
-                   help="代理，支持 http/https/socks5/socks5h")
+                   help="proxy, http/https/socks5/socks5h supported")
     g.add_argument("--ka", "--keep-alive", dest="ka", type=int, default=200,
                    metavar="N",
-                   help="keep-alive 复用次数: 0=无限，N=复用N次后重连，"
-                        "负数=不复用 (默认 200)")
+                   help="keep-alive reuse count: 0=unlimited, N=reconnect "
+                        "after N reuses, negative=no reuse (default 200)")
     g.add_argument("--rt", "--retry-times", dest="rt", type=int, default=3,
-                   metavar="N", help="请求最大失败重试次数 (默认 3)")
+                   metavar="N", help="max retries per request (default 3)")
     g.add_argument("--timeout", type=float, default=10.0, metavar="SEC",
-                   help="单次请求超时秒数 (默认 10)")
+                   help="per-request timeout in seconds (default 10)")
     g.add_argument("--ti", "--thread-interval", dest="ti", default="0",
                    metavar="T",
-                   help="线程内请求间隔，如 1 / 0.2 / 1-3 (默认 0)")
+                   help="per-thread delay, e.g. 1 / 0.2 / 1-3 (default 0)")
     g.add_argument("--mode", type=int, default=2, choices=(1, 2), metavar="1|2",
-                   help="1=目录补 /，2=目录不补 / (默认 2)")
+                   help="1=directories get a trailing /, 2=no / (default 2)")
     g.add_argument("--cs", "--case-sensitive", dest="cs", type=int, default=1,
                    choices=(0, 1), metavar="0|1",
-                   help="大小写敏感，1=开 0=关 (默认 1)")
+                   help="case sensitivity, 1=on 0=off (default 1)")
     g.add_argument("--bh", "--bypass-headers", dest="bh", metavar="V",
-                   help="bypass headers 测试 (待开发)")
+                   help="bypass headers test (not implemented)")
 
-    g = p.add_argument_group("规则")
+    g = p.add_argument_group("rules")
     g.add_argument("--ir", "--ignore-rules", dest="ir", nargs=2,
                    action="append", metavar=("ATTR", "VALUE"),
-                   help="忽略规则，可多次。ATTR: %s" % _IR_ATTRS)
+                   help="ignore rules, repeatable. ATTR: %s" % _IR_ATTRS)
     g.add_argument("--br", "--bypass-rules", dest="br", nargs=2,
                    action="append", metavar=("ATTR", "VALUE"),
-                   help="排除路径规则，可多次。ATTR: %s" % _BR_ATTRS)
+                   help="path exclusion rules, repeatable. ATTR: %s" % _BR_ATTRS)
     g.add_argument("--nb", "--no-bak", dest="nb", action="store_true",
-                   help="不自动添加备份路径：不扫备份文件（名称×后缀）、"
-                        "也不追加目录自身备份。词表里手写的备份名不受影响")
+                   help="no automatic backup paths: no backup files "
+                        "(name x suffix), no directory self backups. Names "
+                        "written in the wordlist are still scanned")
 
-    g = p.add_argument_group("输出")
+    g = p.add_argument_group("output")
     g.add_argument("--of", "--output-file", dest="of", metavar="FILE",
-                   help="结果导出路径")
+                   help="export results to a file")
     g.add_argument("--od", "--ok-dirs", dest="od", action="append",
                    metavar="PATH",
-                   help="已确认存在的目录，形如 dir1/dir2/dir3/。每一层都会"
-                        "被登记为存在并参与递归；每层只发一次 dircheck，"
-                        "伪 404 的层不展开它的词表子目录（链继续往下走）。"
-                        "可多次")
+                   help="directories known to exist, e.g. dir1/dir2/dir3/. "
+                        "Each level is registered and recursed; each level "
+                        "gets one dircheck, and a fake 404 level does not "
+                        "expand its wordlist children (the chain continues). "
+                        "Repeatable")
     g.add_argument("--cq", "--quiet", dest="quiet", action="store_true",
-                   help="安静模式：不输出实时日志，只保留最终报告")
+                   help="quiet mode: no live log, only the final report")
     g.add_argument("--debug", dest="debug", action="store_true",
-                   help="输出诊断信息（探测结算、--od 登记、延迟组放行等）")
+                   help="diagnostics (probe settlement, --od registration, "
+                        "delayed group release, ...)")
 
     p.add_argument("--version", action="version",
                    version="PathScan %s" % VERSION)
@@ -281,7 +292,7 @@ def _normalize_pair(pair, which):
     """
     if len(pair) >= 2:
         return (pair[0], pair[1])
-    raise ValueError("参数需要 2 个值: %r" % (pair,))
+    raise ValueError("expected 2 values, got %r" % (pair,))
 
 
 class Args(object):
@@ -388,7 +399,7 @@ def parse_headers(items):
     headers = {}
     for raw in items or []:
         if ":" not in raw:
-            raise ValueError('--rh 格式应为 "Name: value"，收到 %r' % raw)
+            raise ValueError('--rh expects "Name: value", got %r' % raw)
         name, value = raw.split(":", 1)
         headers[name.strip()] = value.strip()
     return headers
@@ -440,9 +451,9 @@ def parse_depth_range(raw):
     else:
         lo = hi = int(text)
     if lo < 0:
-        raise ValueError("层级不能为负: %r" % raw)
+        raise ValueError("depth must not be negative: %r" % raw)
     if hi is not None and hi < lo:
-        raise ValueError("层级区间非法: %r" % raw)
+        raise ValueError("invalid depth range: %r" % raw)
     return (lo, hi)
 
 
@@ -464,7 +475,7 @@ def load_wordlist(path, kind):
     if not path:
         return entries, bad
     if not os.path.isfile(path):
-        raise IOError("词表文件不存在: %s" % path)
+        raise IOError("wordlist not found: %s" % path)
     import json
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for lineno, raw in enumerate(fh, 1):
@@ -520,34 +531,35 @@ def validate(args, printer=None):
     """语义校验，出错返回错误信息列表。"""
     errors = []
     if args.thread < 1:
-        errors.append("线程数必须 >= 1")
+        errors.append("thread count must be >= 1")
     if args.recursion < 1:
-        errors.append("递归层数必须 >= 1")
+        errors.append("recursion depth must be >= 1")
     if args.rt < 0:
-        errors.append("重试次数不能为负")
+        errors.append("retry count must not be negative")
     if args.method.lower() not in METHODS:
-        errors.append("请求方法 %r 不支持，可选: %s"
+        errors.append("unsupported method %r, pick one of: %s"
                       % (args.method, "/".join(METHODS)))
     if not os.path.isfile(args.dir):
-        errors.append("目录词表不存在: %s" % args.dir)
+        errors.append("directory wordlist not found: %s" % args.dir)
     if not os.path.isfile(args.file):
-        errors.append("文件词表不存在: %s" % args.file)
+        errors.append("file wordlist not found: %s" % args.file)
     if args.files and not os.path.isfile(args.files):
-        errors.append("带后缀文件词表不存在: %s" % args.files)
+        errors.append("file wordlist not found: %s" % args.files)
     if args.of:
         outdir = os.path.dirname(os.path.abspath(args.of))
         if not os.path.isdir(outdir):
-            errors.append("输出目录不存在: %s" % outdir)
+            errors.append("output directory not found: %s" % outdir)
     if args.proxy:
         scheme = args.proxy.split("://", 1)[0].lower()
         if scheme not in ("http", "https", "socks5", "socks5h", "socks4",
                           "socks4a"):
-            errors.append("代理协议 %r 不支持" % scheme)
+            errors.append("unsupported proxy scheme %r" % scheme)
         elif scheme.startswith("socks"):
             try:
                 import socks  # noqa: F401
             except ImportError:
-                errors.append("使用 socks 代理需要安装 PySocks: pip install PySocks")
+                errors.append("socks proxy requires PySocks: "
+                              "pip install PySocks")
     if getattr(args, "mask_error", None):
         errors.append(args.mask_error)
     return errors
@@ -560,9 +572,9 @@ def banner(args, sizes, printer):
     lines.append("=" * 66)
     lines.append(" PathScan %s" % VERSION)
     lines.append("=" * 66)
-    lines.append(" 目标 : %s" % args.url)
-    lines.append(" 后缀 : %s" % (", ".join(args.suffixes) or "(无)"))
-    lines.append(" 词表 : 目录 %d / 文件 %d / 带后缀文件 %d"
+    lines.append(" target : %s" % args.url)
+    lines.append(" suffix : %s" % (", ".join(args.suffixes) or "(none)"))
+    lines.append(" words  : dir %d / file %d / file-with-suffix %d"
                  % (sizes["dirs"], sizes["files"], sizes["files_ext"]))
     lines.append("=" * 66)
     for line in lines:

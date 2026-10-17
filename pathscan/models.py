@@ -27,7 +27,7 @@ PRIO_DIR = 1
 # 文件最后：等目录都扫完了再集中扫。
 PRIO_FILE = 2
 
-PRIO_NAMES = {PRIO_PROBE: "探测", PRIO_DIR: "目录", PRIO_FILE: "文件"}
+PRIO_NAMES = {PRIO_PROBE: "probe", PRIO_DIR: "dir", PRIO_FILE: "file"}
 
 # 速度滑动窗口的桶数。速度 = 窗口内请求数 / SPEED_WINDOW，
 # 用 1 秒一个桶，所以这个值同时也是窗口的秒数。
@@ -259,7 +259,7 @@ class TaskQueue(object):
         return iter(out)
 
     def __repr__(self):
-        return "<TaskQueue %d 待处理 %s>" % (self.count, self.counts())
+        return "<TaskQueue %d pending %s>" % (self.count, self.counts())
 
 
 class _FifoBucket(object):
@@ -767,7 +767,7 @@ class GlobalState(object):
                     "code": rec.get("code"),
                     "size": rec.get("size"),
                     "location": rec.get("location"),
-                    "reason": "dircheck 软 404",
+                    "reason": "dircheck soft 404",
                 })
             return len(dropped)
 

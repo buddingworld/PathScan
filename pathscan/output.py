@@ -328,10 +328,10 @@ def print_report(state, args, printer):
 def write_output(path, state, args):
     """把结果与失败项写到 --of 指定文件。"""
     lines = []
-    lines.append("# PathScan 扫描结果")
-    lines.append("# 目标: %s" % args.url)
-    lines.append("# 时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
-    lines.append("# 结果数: %d  忽略数: %d  失败数: %d"
+    lines.append("# PathScan results")
+    lines.append("# target: %s" % args.url)
+    lines.append("# time: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("# results: %d  ignored: %d  errors: %d"
                  % (len(state.results), len(state.ignored),
                     len(state.errors)))
     lines.append("")

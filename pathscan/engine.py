@@ -57,7 +57,7 @@ class Worker(threading.Thread):
                 try:
                     self.handle(task)
                 except Exception as exc:                # 任何任务级异常都不能杀线程
-                    self.engine.printer.raw("! 任务处理异常 %s: %r"
+                    self.engine.printer.raw("! task failed %s: %r"
                                             % (task.path, exc))
                 finally:
                     state.complete(task)
@@ -133,7 +133,7 @@ class Worker(threading.Thread):
             # 并终止扫描，用户拿 --ir 也拦不住。
             if rule is not None:
                 resp.mark_ignored()
-                engine.debug("探针 %s 被 --ir 判为 404，按未命中结算" % url)
+                engine.debug("probe %s matched --ir, settled as not found" % url)
             # 同批探测里 dircheck 先回来、把该目录判成了软 404：这个在途探测
             # 的结论已经没有意义（延迟组整组作废），静默结算即可，别再报
             # 「命中 / 跳过」误导用户；根目录被判死时同样能省掉终止后的噪声。
@@ -156,7 +156,7 @@ class Worker(threading.Thread):
         if rule is not None:
             reason = "--ir %s %s" % (rule["attr"], rule["raw"])
             self.live(task, url, False, resp.code)
-            engine.debug("忽略 %s (%s)" % (url, reason))
+            engine.debug("ignored %s (%s)" % (url, reason))
             return
 
         exists = resp.exists
@@ -228,7 +228,7 @@ class Worker(threading.Thread):
         state.thread_pause(self.thread_id)
         try:
             self.engine.printer.info(
-                "线程 %d 连续失败 %d 次，暂停 %.0fs"
+                "thread %d: %d failures in a row, pausing %.0fs"
                 % (self.thread_id, n, THREAD_FAIL_PAUSE), tag="!")
             if self._sleep_interruptible(THREAD_FAIL_PAUSE):
                 return                      # 被终止/惩罚期间收到指令
@@ -236,12 +236,13 @@ class Worker(threading.Thread):
             if state.all_other_threads_idle(self.thread_id):
                 # 所有线程都在暂停 -> IP 大概率被封，转 WAF 等待模式
                 self.engine.printer.info(
-                    "所有线程均失败暂停，疑似 IP 被拦截，进入 WAF 等待模式",
-                    tag="!")
+                    "all threads paused after failures, IP likely blocked, "
+                    "entering WAF wait mode", tag="!")
                 state.waf_request_wait()
             else:
                 self.engine.printer.info(
-                    "线程 %d 恢复（其他线程正常）" % self.thread_id, tag="*")
+                    "thread %d resumed (other threads are healthy)"
+                    % self.thread_id, tag="*")
         finally:
             state.thread_resume(self.thread_id)
 
@@ -315,7 +316,7 @@ class Engine(object):
         if self.state.is_name_bypassed(task.name):
             return
         if self.state.waf_note_fail(task.name):
-            self.debug("WAF 观察: %s（失败 %d 次）" % (task.name, task.trytimes))
+            self.debug("WAF watch: %s (%d failures)" % (task.name, task.trytimes))
 
     def waf_sweep(self):
         """周期性统计观察窗口，把孤立的失败名称加入忽略列表。
@@ -325,10 +326,10 @@ class Engine(object):
         """
         blocked, dropped = self.state.waf_collect_due()
         for name in blocked:
-            self.printer.info("WAF 检测: 名称 %r 加入忽略列表，后续不再检测"
-                              % name, tag="!")
+            self.printer.info("WAF check: name %r added to the ignore list, "
+                              "no longer tested" % name, tag="!")
         for name in dropped:
-            self.debug("WAF 观察: %s 移除（同期还有其他失败项）" % name)
+            self.debug("WAF watch: %s dropped (other names failed too)" % name)
         return blocked
 
     # ------------------------------------------------------------------
@@ -378,7 +379,7 @@ class Engine(object):
         for task in self.filter_tasks(tasks):
             if not self.state.claim_url(task.path, task.type,
                                         bool(self.args.cs)):
-                self.debug("去重跳过 %s" % task.path)
+                self.debug("dedup skipped %s" % task.path)
                 continue
             accepted.append(task)
         if accepted:
@@ -442,7 +443,7 @@ class Engine(object):
         self.maybe_open_ok_dirs()
 
         with state.lock:
-            self.printer.info("队列已就绪，启动 %d 个线程..." % args.thread)
+            self.printer.info("queue ready, starting %d thread(s)..." % args.thread)
         for i in range(args.thread):
             w = Worker(self, i)
             self.workers.append(w)
@@ -462,8 +463,8 @@ class Engine(object):
             if self.state.probe_wait.get(""):
                 return
             self._ok_dirs_done = True
-        self.debug("根目录探测结算完成（probe_wait=%s），开始登记 --od 目录"
-                   % (waiting or "空"))
+        self.debug("root probes settled (probe_wait=%s), registering --od dirs"
+                   % (waiting or "empty"))
         self.open_ok_dirs()
 
     def open_ok_dirs(self):
@@ -516,10 +517,10 @@ class Engine(object):
         """
         dead = self._dead_ancestor_outside_od(path)
         if dead is not None:
-            self.debug("od 跳过 %r：%r 已被判为软 404" % (path, dead))
+            self.debug("od skip %r: %r is a soft 404" % (path, dead))
             return False
         if path in self.state.opened:
-            self.debug("od 跳过 %r：已登记过" % path)
+            self.debug("od skip %r: already registered" % path)
             return False
         self.state.od_paths.add(path)
         # 先占去重名额，保证 od 的写法优先于词表里的大小写变体
@@ -530,7 +531,7 @@ class Engine(object):
         if self.filter_tasks([task]):
             self.state.enqueue([task])
         self.open_dir(path, assume_ok=True)
-        self.debug("od 认定存在并加入递归 %r" % path)
+        self.debug("od registered %r as existing, recursing" % path)
         return True
 
     def _dead_ancestor_outside_od(self, path):
@@ -594,8 +595,8 @@ class Engine(object):
                 # 探针没入队（被 --br / 去重拦下）就即时结算，
                 # 否则这层的延迟组永远等不到放行
                 state.note_verdict(dirpath, "dead", value=False)
-            self.debug("--od 登记目录 %r（常规 %d / 备份 %d），待 dircheck 放行"
-                       % (dirpath, len(common), len(backup)))
+            self.debug("--od registered %r (common %d / backup %d), waiting "
+                       "for dircheck" % (dirpath, len(common), len(backup)))
             return
 
         # 3) 探测任务本身：直接入队
@@ -626,7 +627,7 @@ class Engine(object):
             state.note_verdict(dirpath, kind, suffix, value)
 
         n = self.add_tasks(probe_tasks, "probe")
-        self.debug("展开目录 %r: 探测 %d 个, 暂存常规 %d / 备份 %d"
+        self.debug("opened %r: %d probes, %d common / %d backup staged"
                    % (dirpath or "/", n, len(common), len(backup)))
 
     @property
@@ -655,42 +656,42 @@ class Engine(object):
             withdrawn = state.withdraw_dead_results(parent)
             if parent == "":
                 self.printer.raw("!")
-                self.printer.raw("! 根目录探测命中：目标对任意路径都返回 %s"
-                                 % resp.code)
+                self.printer.raw("! root dircheck hit: the target answers %s "
+                                 "for any path" % resp.code)
                 # 终止前把触发终止的这次请求（关键请求）的响应关键信息打出来：
                 # 只有「终止」没有证据，用户无法判断服务器到底回了什么
                 # （真软 404 / WAF 拦截页 / 代理注入），也就无从排查。
-                self.printer.raw("! 关键请求: %s %s"
+                self.printer.raw("! key request: %s %s"
                                  % (self.args.method.upper(), resp.url))
-                self.printer.raw("! 响应关键信息: %s" % resp.key_info())
-                self.printer.raw("! 无法继续扫描，终止。")
+                self.printer.raw("! key response: %s" % resp.key_info())
+                self.printer.raw("! cannot continue, stopping.")
                 self.printer.raw("!")
                 state.stop_flag = True
                 with state.lock:
                     state.cond.notify_all()
             else:
-                msg = ("目录 %s 判定为软 404（%s -> %s），跳过其下所有路径"
-                       % (parent, url, resp.code))
+                msg = ("dir %s is a soft 404 (%s -> %s), skipping everything "
+                       "under it" % (parent, url, resp.code))
                 if withdrawn:
-                    msg += "，撤回 %d 条结果" % withdrawn
+                    msg += ", withdrew %d result(s)" % withdrawn
                 self.printer.info(msg, tag="!")
         else:
             state.note_verdict(parent, "dead", value=False)
-            self.debug("dircheck 通过 %s -> %s" % (parent or "/", resp.code))
+            self.debug("dircheck passed %s -> %s" % (parent or "/", resp.code))
 
     def on_suffix_result(self, task, url, resp):
         """后缀探测命中 => 该后缀在该目录下不可信，之后不再扫。"""
         state = self.state
         suffix = suffix_of(task.name)
         if suffix is None:
-            self.debug("后缀探针 %s 无法解析后缀，忽略" % task.name)
+            self.debug("suffix probe %s: no suffix, ignored" % task.name)
             return
         usable = not resp.exists
         if resp.exists:
-            self.printer.info("后缀 %s 在 %s 下疑似被规则放行，跳过该后缀"
+            self.printer.info("suffix %s looks allowed under %s, skipping it"
                               % (suffix, task.parent or "/"), tag="!")
         else:
-            self.debug("后缀探测通过 %s%s"
+            self.debug("suffix probe passed %s%s"
                        % (task.parent and task.parent + "/", suffix))
         state.note_verdict(task.parent, "ext", suffix, usable)
 
@@ -703,7 +704,7 @@ class Engine(object):
         """
         if task.from_ == "dircheck":
             self.state.note_verdict(task.parent, "dead", value=False)
-            self.debug("dircheck 失败 %s，按未命中处理"
+            self.debug("dircheck failed %s, treated as not hit"
                        % (task.parent or "/"))
         elif task.from_ == "suffixcheck":
             # 探测失败时保守放行：少扫的风险大于多扫
@@ -752,7 +753,7 @@ class Engine(object):
         if self.args.nb:
             return
         if task.waf:
-            self.debug("目录 %s 标注了 waf，跳过其备份 %s.*"
+            self.debug("dir %s is marked waf, skipping its backups %s.*"
                        % (task.path, task.name))
             return
         dirname = task.name
@@ -762,7 +763,7 @@ class Engine(object):
             task.parent, dirname, self.remark_for(task), task.waf)
         n = self.add_tasks(tasks)
         if n:
-            self.debug("目录 %s 命中，追加 %d 个自身备份任务"
+            self.debug("dir %s hit, queued %d self backup task(s)"
                        % (task.path, n))
 
 

@@ -229,7 +229,7 @@ def test_waf_wait_auto_resume():
     print("  耗时 %.2fs pause_event=%s" % (el, st.pause_event.is_set()))
     assert st.pause_event.is_set(), "无人值守应自动恢复"
     assert not st.waf_waiting
-    assert "无人值守" in pr.text(), pr.text()
+    assert "no input for" in pr.text(), pr.text()
     print("  test_waf_wait_auto_resume OK")
 
 
@@ -246,7 +246,7 @@ def test_waf_wait_keypress_goes_repl():
     ctl.enter_waf_wait()
     print("  repl 调用次数:", len(called))
     assert called == [1], called
-    assert "检测到输入" in pr.text(), pr.text()
+    assert "keypress detected" in pr.text(), pr.text()
     print("  test_waf_wait_keypress_goes_repl OK")
 
 
@@ -433,16 +433,16 @@ def test_live_path_alignment():
     width = output.LIVE_PATH_WIDTH
     buf = FakeTTY()
     pr = output.Printer(live=True, stream=buf)
-    pr.live_line(0, "a", False, speed=1.0)                 # 很短
-    pr.live_line(1, "b" * (width - 1), True, speed=2.0)    # 正好
-    pr.live_line(2, "c" * (width + 20), False, speed=3.0)  # 超长
+    pr.live_line(0, "a", False, speed=1.0, code=404)        # 很短
+    pr.live_line(1, "b" * (width - 1), True, speed=2.0, code=200)   # 正好
+    pr.live_line(2, "c" * (width + 20), False, speed=3.0, code=404)  # 超长
     pr.finish_live()
 
     rows = [r for r in buf.getvalue().split("\r") if r.strip()]
     marks = []
     for row in rows:
-        # [ok ] 补了一个空格与 [err] 等长，所以这里允许标记内出现空格
-        m = re.search(r"\[(ok |err)\]", row)
+        # 标记是服务器返回的状态码（3 位数），长度一致才能对齐
+        m = re.search(r"\[\d{3}\]", row)
         assert m, row
         marks.append(m.start())
     print("  状态标记起始列: %s" % marks)
@@ -450,12 +450,9 @@ def test_live_path_alignment():
     assert marks[0] == marks[1], marks
     assert marks[2] > marks[1], "超长路径应在更右侧: %s" % marks
 
-    # [ok ] 与 [err] 的标记长度必须一致，否则后面的 Speed 会对不齐
-    assert len("[ok ]") == len("[err]")
-    ok_rows = [r for r in rows if "[ok ]" in r]
-    err_rows = [r for r in rows if "[err]" in r]
-    assert ok_rows and err_rows, rows
-    print("  OK/ERR 标记等长: [ok ] / [err]")
+    # 三位状态码标记等长，后面的 Speed 才对得齐
+    assert len("[404]") == len("[200]")
+    print("  状态码标记: [200] / [404]")
     print("  test_live_path_alignment OK")
 
 
@@ -508,7 +505,7 @@ def test_ctrl_c_twice_stops():
     ctl.on_sigint(None, None)
     print("  stop_flag=%s" % st.stop_flag)
     assert st.stop_flag
-    assert "再次中断" in buf.getvalue()
+    assert "interrupted again" in buf.getvalue()
     print("  test_ctrl_c_twice_stops OK")
 
 
@@ -601,24 +598,24 @@ def test_remark_shown_only_on_non_404():
     # 命中（非 404）-> 显示备注
     buf = FakeTTY()
     pr = output.Printer(live=True, stream=buf)
-    pr.live_line(0, "admin", True, speed=1.0, remark="ZhiyuanOA")
+    pr.live_line(0, "admin", True, speed=1.0, remark="ZhiyuanOA", code=200)
     pr.finish_live()
     text = buf.getvalue()
-    print("  [ok ] 行:", text.strip())
+    print("  [200] 行:", text.strip())
     assert "#ZhiyuanOA" in text, text
 
     # 404（ok=False）-> 不显示备注
     buf2 = FakeTTY()
     pr2 = output.Printer(live=True, stream=buf2)
-    pr2.live_line(0, "admin", False, speed=1.0, remark="ZhiyuanOA")
+    pr2.live_line(0, "admin", False, speed=1.0, remark="ZhiyuanOA", code=404)
     pr2.finish_live()
-    print("  [err] 行:", buf2.getvalue().strip())
+    print("  [404] 行:", buf2.getvalue().strip())
     assert "ZhiyuanOA" not in buf2.getvalue(), buf2.getvalue()
 
     # 备注为空时也不出现多余的 #
     buf3 = FakeTTY()
     pr3 = output.Printer(live=True, stream=buf3)
-    pr3.live_line(0, "admin", True, speed=1.0, remark="")
+    pr3.live_line(0, "admin", True, speed=1.0, remark="", code=200)
     pr3.finish_live()
     assert "#" not in buf3.getvalue(), buf3.getvalue()
 
