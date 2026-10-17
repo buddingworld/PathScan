@@ -17,10 +17,6 @@ import time
 
 _RAND_CHARS = string.ascii_lowercase + string.digits
 
-# 备份探针的固定名前缀（probes.py 用它生成探针名）。
-# 放在 models 里是因为任务优先级要按它判断，而 models 不能反向依赖 probes。
-PROBE_PREFIX = "__probe__"
-
 # ----------------------------------------------------------------------
 # 任务优先级：数字越小越先执行
 # ----------------------------------------------------------------------
@@ -183,8 +179,6 @@ def task_priority(task):
     """
     if task.from_ in ("dircheck", "suffixcheck"):
         return PRIO_PROBE
-    if task.from_ == "backup" and task.name.startswith(PROBE_PREFIX):
-        return PRIO_PROBE
     return PRIO_DIR if task.type == "dir" else PRIO_FILE
 
 
@@ -315,23 +309,14 @@ def suffix_of(name):
     return name[dot:]
 
 
-def _match_backup_suffix(name, suffixes):
-    """按最后一个点解析后缀，再在 suffixes 里查。
-
-    后缀统一取最后一个点之后的部分（``db.tar.gz`` 视为 ``.gz``）。
-    suffixes 是 dict，键为后缀；返回命中的键，没有则 None。
-    """
-    suffix = suffix_of(name)
-    if suffix is None:
-        return None
-    return suffix if suffix in suffixes else None
-
-
 def _coerce_task(item):
     """exec 可能往队列里塞任意值，统一成 Task 以免调度器崩。
 
     规格的示例是 ``test_list.add(123)``——把值当成目录名处理，
     所以 123 会变成扫描 ``/123``。传 dict 则按 Task 的 JSON 字段解析。
+
+    名字两端的斜杠去掉：``add("admin/")`` 命中后加后缀会拼出
+    ``admin/.zip`` 这种空文件名路径。
     """
     if isinstance(item, Task):
         return item
@@ -340,7 +325,7 @@ def _coerce_task(item):
         if not task.from_ or task.from_ == "common":
             task.from_ = "exec"
         return task
-    return Task(type="dir", name=str(item), from_="exec")
+    return Task(type="dir", name=str(item).strip("/"), from_="exec")
 
 
 class GlobalState(object):
@@ -365,6 +350,9 @@ class GlobalState(object):
         self.dead_dirs = set()             # 判定为 404 的目录路径（前缀语义）
         self.ext_probe = {}                # (dirpath, ext) -> True=可用 / False=不可信
         self.opened = set()                # 已经登记过探测任务的目录
+        # --od / od 指令声明的「已确认存在」目录。它们即便被 dircheck 判成
+        # 软 404，也要继续沿链打开下一层（用户明确说了它存在）。
+        self.od_paths = set()
         # 延迟任务组：一个目录的常规任务要等该目录的全部探测出结论才放行，
         # 否则会在「后缀还没探完」时就把该后缀的任务扫掉。
         self.groups = {}                   # dirpath -> {key: [Task]}
@@ -574,6 +562,25 @@ class GlobalState(object):
         with self.lock:
             self.ext_probe[(dirpath, ext)] = usable
 
+    def path_under_blocked(self, path):
+        """路径的某个上级目录是否已被 WAF 拉黑 / 加入忽略列表。
+
+        名称过滤只比对任务自己的名字，``actuator/.zip`` 这种子路径的名字里
+        不含敏感串，会整批漏网——可目录都被拉黑了，它下面的请求发出去只会
+        再喂一遍那条 WAF 规则。这里按路径逐段回溯，把「父目录被过滤」推广成
+        「整棵子树不再发请求」。
+        """
+        if not path or "/" not in path:
+            return False
+        with self.lock:
+            if not self.name_blocked and not self.bypass_names:
+                return False
+            # 只看上级目录段：任务自己的名字由 is_name_blocked 单独判断
+            for seg in path.split("/")[:-1]:
+                if seg in self.name_blocked or seg in self.bypass_names:
+                    return True
+            return False
+
     # ------------------------------------------------------------------
     # 延迟任务组与探测结算
     # ------------------------------------------------------------------
@@ -590,8 +597,7 @@ class GlobalState(object):
         """
         with self.lock:
             self.probe_wait[dirpath] = count
-            self.verdicts.setdefault(dirpath, {"dead": False, "exts": {},
-                                               "backups": {}})
+            self.verdicts.setdefault(dirpath, {"dead": False, "exts": {}})
 
     def note_verdict(self, dirpath, kind, key=None, value=None):
         """记录一条探测结论。返回本次结算后要放行的任务列表（可能为空）。
@@ -601,18 +607,13 @@ class GlobalState(object):
         """
         with self.lock:
             verdict = self.verdicts.setdefault(
-                dirpath, {"dead": False, "exts": {}, "backups": {}})
+                dirpath, {"dead": False, "exts": {}})
             if kind == "dead":
                 # value=False 表示 dircheck 通过（该目录不是软 404）。
                 # 只有明确命中才算死目录，漏掉这个判断会把每个目录都判死。
                 if value is not False:
                     verdict["dead"] = True
                     self.dead_dirs.add(dirpath)
-            elif kind == "backup":
-                # 逐后缀判定：key 是备份后缀（.zip / .tar.gz ...），
-                # value=False 表示该后缀的探针命中（服务器对这类后缀一律放行），
-                # 该后缀的备份任务全部作废。
-                verdict["backups"][key] = value
             elif kind == "ext":
                 verdict["exts"][key] = value
                 self.ext_probe[(dirpath, key)] = value
@@ -656,9 +657,6 @@ class GlobalState(object):
             return []
 
         ext_ok = verdict.get("exts") or {}
-        # 逐后缀的备份结论：{".zip": False} 表示 .zip 的备份探针命中，
-        # 该后缀的备份任务不值得再扫（服务器对这类后缀一律放行）。
-        backup_ok = verdict.get("backups") or {}
         released = []
 
         # common 优先，之后才是 backup
@@ -673,11 +671,6 @@ class GlobalState(object):
                 if key == "common" and task.type == "file":
                     suffix = suffix_of(task.name)
                     if suffix is not None and ext_ok.get(suffix) is False:
-                        continue
-                # 备份任务按自己的后缀逐个判断
-                if key == "backup" and backup_ok:
-                    suffix = _match_backup_suffix(task.name, backup_ok)
-                    if suffix is not None and backup_ok.get(suffix) is False:
                         continue
                 released.append(task)
         return released
@@ -739,29 +732,44 @@ class GlobalState(object):
             self.results.append(rec)
             return True
 
-    def add_ignored(self, task, url, code, size, location=None, reason=""):
-        """记录一条被视为 404 而忽略的路径（最终报告里单列一节）。
+    def withdraw_dead_results(self, dirpath):
+        """撤回软 404 目录已记录的结果（目录自身 + 其下所有路径）。
 
-        只收**目录**：目录一旦被 --ir 判为 404，就不能再递归下去，
-        这个「为什么不往下扫」的结论必须留痕，否则整棵子树静默消失。
-        文件和备份路径被忽略是常态（软 404 服务器上遍地都是），逐个列出
-        既没有信息量又会把报告刷爆，所以它们不进这一节，与普通 404 一样
-        只体现在实时日志的一行 [err]，最终报告里完全不出现。
+        dircheck 命中意味着「该目录下所有路径都返回 200」：此前记录的命中
+        都是这个假目录的产物。扫描器已经不会再扫它下面的路径，报告里也不该
+        让这些条目以「存在」的姿态留着——它们转入 Ignored Paths 留痕，
+        和 --ir 忽略的目录摆在同一个位置。返回撤回的条数。
         """
-        if task.type != "dir":
-            return
         with self.lock:
-            self.ignored.append({
-                "path": task.path,
-                "url": url,
-                "type": task.type,
-                "from": task.from_,
-                "remark": task.remark,
-                "code": code,
-                "size": size,
-                "location": location,
-                "reason": reason,
-            })
+            prefix = dirpath + "/" if dirpath else ""
+            kept = []
+            dropped = []
+            for rec in self.results:
+                path = rec.get("path") or ""
+                # 根目录（dirpath == ""）被判软 404 时，所有结果都不可信
+                if not dirpath or path == dirpath or path.startswith(prefix):
+                    dropped.append(rec)
+                else:
+                    kept.append(rec)
+            if not dropped:
+                return 0
+            self.results = kept
+            for rec in dropped:
+                # 报告里只列目录（文件数量大且多为噪声），文件撤回即可不留痕
+                if rec.get("type") != "dir":
+                    continue
+                self.ignored.append({
+                    "path": rec.get("path"),
+                    "url": rec.get("url"),
+                    "type": rec.get("type"),
+                    "from": rec.get("from"),
+                    "remark": rec.get("remark"),
+                    "code": rec.get("code"),
+                    "size": rec.get("size"),
+                    "location": rec.get("location"),
+                    "reason": "dircheck 软 404",
+                })
+            return len(dropped)
 
     def add_error(self, task, url, reason):
         with self.lock:

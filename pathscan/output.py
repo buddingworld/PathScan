@@ -86,12 +86,16 @@ def human_size(n):
     return "%dT" % n
 
 
-def status_marker(name):
-    """实时日志里的标记：ok=命中会保留，err=会被刷掉。
+def status_marker(ok, code=None):
+    """实时日志里的标记：命中会保留，非命中会被后续请求覆盖。
 
-    ``[ok ]`` 补一个空格，长度与 ``[err]`` 对齐。
+    有状态码就显示状态码（``[200]`` / ``[404]`` / ``[403]``）——用户要看的是
+    服务器到底回了什么，而不是一个笼统的 ``[err]``。只有网络层失败
+    （连不上、超时、连接被重置）才标 ``[err]``，那时压根没有状态码。
     """
-    return "ok " if name else "err"
+    if code is not None:
+        return str(code)
+    return "ok " if ok else "err"
 
 
 class Printer(object):
@@ -149,8 +153,11 @@ class Printer(object):
     # ------------------------------------------------------------------
     # 实时日志
     # ------------------------------------------------------------------
-    def live_line(self, thread_id, path, ok, speed=None, remark=""):
+    def live_line(self, thread_id, path, ok, speed=None, remark="", code=None):
         """打一条实时日志。ok=True 时固定，否则会被后续请求覆盖。
+
+        标记按 code 显示状态码（``[200]`` / ``[404]``），只有网络层失败
+        （code 为 None）才显示 ``[err]``。
 
         实时日志只走屏幕，从不写进 --of 的文件（导出走 format_report）。
         路径不足 LIVE_PATH_WIDTH 时补空格对齐；超长则原样输出（此时会牺牲
@@ -165,7 +172,7 @@ class Printer(object):
         # 先按「纯前缀 + 路径」拼，路径对齐到固定宽度
         head = "ThreadID:%d  ->  " % thread_id
         body = ("/" + path).ljust(LIVE_PATH_WIDTH)
-        text = "%s%s [%s]" % (head, body, status_marker(ok))
+        text = "%s%s [%s]" % (head, body, status_marker(ok, code))
         if speed is not None:
             text += "  Speed: %.1f/s" % speed
         if ok and remark:

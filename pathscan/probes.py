@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
-"""探测机制：目录探测(dircheck)、后缀检测、备份文件检测。
+"""探测机制：目录探测(dircheck)与后缀检测。
 
-三种探测的目的都是「提前知道服务器会不会说谎」：
+两种探测的目的都是「提前知道服务器会不会说谎」：
 * dircheck   —— 服务器是否对任意路径都返回 200（软 404 / 万能 200）
 * 后缀检测   —— 该目录下某个后缀是否根本不解析（比如未装 PHP 时 .php 全 404）
-* 备份文件   —— 常见备份名 + 域名派生名，这类文件命中率高且常被漏扫
+
+备份文件不另设探针：曾经用「随机名 + 具体后缀」（``__probe__xxxxxxxx.log``）
+逐后缀探测服务器是否放行，但这类名字几乎必被 WAF 拦（.log/.env/.bak 都是
+敏感后缀），而探针优先级最高、开机第一批就是它们，规则一拦整个扫描还没出
+结果就卡住了。备份文件该不该信，交给 dircheck（纯随机字符串）与 --ir 判断。
 """
 
 import itertools
 
-from .models import PROBE_PREFIX, Task, join_path, rand_token, suffix_of
+from .models import Task, join_path, rand_token, suffix_of
 
 # ----------------------------------------------------------------------
 # 备份文件名
@@ -103,7 +107,7 @@ def build_backup_tasks(args, hostname, parent, remark=""):
     return tasks
 
 
-def backup_probe_group_id(parent):
+def backup_group_id(parent):
     return ("backup", parent)
 
 
@@ -115,35 +119,6 @@ def suffix_group_id(parent, suffix):
     return ("suffix", parent, suffix)
 
 
-def make_backup_probe_tasks(parent, suffixes, remark=""):
-    """备份文件检测的探针：每个备份后缀各探一次。
-
-    随机名 + 具体后缀（``__probe__ab12cd34.zip``、``__probe__ab12cd34.rar``），
-    用来逐个判断「该后缀的备份文件」是否被服务器放行。
-
-    用具体后缀而不是随机后缀：某些站点只对特定扩展名放行（比如对 .zip 一律
-    返回 200 的下载路由），用随机后缀要么撞不上、要么把结论张冠李戴。
-
-    名字带 ``__probe__`` 前缀，engine 靠它把探针和真正的备份任务区分开
-    ——两者 from 都是 "backup"。
-    """
-    stem = PROBE_PREFIX + rand_token(8)
-    return [Task(type="file", name=stem + suffix, parent=parent,
-                 from_="backup", remark=remark) for suffix in suffixes]
-
-
-def backup_suffix_of(name, suffixes):
-    """按最后一个点解析后缀，再在 suffixes 里查。
-
-    ``db.tar.gz`` 视为 ``.gz``（只看最后一个点）。suffixes 是可迭代的后缀
-    集合，返回命中的后缀，没有则 None。
-    """
-    suffix = suffix_of(name)
-    if suffix is None:
-        return None
-    return suffix if suffix in suffixes else None
-
-
 def build_dir_backup_tasks(parent, dirname, remark="", waf=0):
     """目录确认存在后，把它自身的打包备份加进队列。
 
@@ -151,7 +126,13 @@ def build_dir_backup_tasks(parent, dirname, remark="", waf=0):
 
     ``parent`` 是该目录所在的父目录，``dirname`` 是它自己的名字。
     生成的任务是文件类型，``from`` 为 ``backup_suffix``。
+
+    名字两端的斜杠先去掉：``--ed "admin/"`` 这种写法会带着尾斜杠进来，
+    拼出 ``admin/.zip``——文件名是空的，只剩个后缀。这种路径压根不该存在。
     """
+    dirname = dirname.strip("/")
+    if not dirname:
+        return []
     tasks = []
     for suffix in DIR_BACKUP_SUFFIXES:
         tasks.append(Task(type="file", name=dirname + suffix, parent=parent,
@@ -196,8 +177,14 @@ def build_leaf_tasks(name, remark, waf, parent, from_, args, type_,
 
     文件条目会按 --file-pre / -s / --files 展开成多个 name。
     depth_lo/depth_hi 来自备注的 "r" 字段，限定该条目只在这些层级测试。
+
+    名字两端的斜杠先去掉：条目写成 ``admin/`` 时，加后缀会拼出
+    ``admin/.zip`` 这种空文件名路径，压根不该发出去。
     """
     tasks = []
+    name = name.strip("/")
+    if not name:
+        return tasks
     if type_ == "dir":
         tasks.append(Task(type="dir", name=name, parent=parent, from_=from_,
                           remark=remark, waf=waf,

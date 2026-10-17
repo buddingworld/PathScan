@@ -627,9 +627,11 @@ def test_remark_shown_only_on_non_404():
     st.add_result({"path": "admin", "url": "http://t/admin", "type": "dir",
                    "code": 200, "size": 10, "location": None,
                    "from": "common", "remark": "ZhiyuanOA", "depth": 1})
-    st.add_ignored(mk_task("ignored1", type_="dir"), "http://t/ignored1",
-                   301, 0, "/x", "--ir test")
-    st.ignored[-1]["remark"] = "不该出现"
+    # 撤回一个软 404 目录（它是报告里唯一会进 Ignored Paths 的来源）
+    st.add_result({"path": "ignored1", "url": "http://t/ignored1",
+                   "type": "dir", "code": 200, "size": 0, "location": "/x",
+                   "from": "common", "remark": "不该出现", "depth": 1})
+    st.withdraw_dead_results("ignored1")
     report = "\n".join(output.format_report(st, mk_args()))
     print("  --- 报告 ---")
     for line in report.splitlines():
@@ -743,12 +745,13 @@ def test_ok_dirs_skips_probe_and_recurses():
     assert by["admin/backend/users"]["from"] == "common"
     print("  递归找到 admin/backend/users: OK")
 
-    # --od 目录不该出现 dircheck 探测请求（随机名.随机后缀）
+    # --od 的每一层各探一次 dircheck（随机名，纯 8 位）：od 路径也可能
+    # 落在伪 404 区里，那种目录不该把整份词表都扫一遍。
     import re
     od_probes = [p for p in counter
-                 if re.match(r"^/(admin|admin/backend)/[a-z0-9]{8}\.[a-z0-9]{5}$", p)]
-    print("  --od 目录的 dircheck 请求数: %d (应为 0)" % len(od_probes))
-    assert not od_probes, od_probes
+                 if re.match(r"^/(admin|admin/backend)/[a-z0-9]{8}$", p)]
+    print("  --od 每层的 dircheck 请求: %s (应为 2 条)" % od_probes)
+    assert len(od_probes) == 2, od_probes
 
     # 报告里不应出现 [od] 占位项
     report = "\n".join(output.format_report(st, args))
@@ -757,6 +760,90 @@ def test_ok_dirs_skips_probe_and_recurses():
         print("   |", line)
     assert "[od]" not in report, report
     print("  test_ok_dirs_skips_probe_and_recurses OK")
+
+
+def test_od_fake_layer_skips_wordlist_children():
+    """--od 链里某层是伪 404 时：跳过该层的词表子目录，链照走。
+
+    现场形态：``--od dir1/dir2/dir3`` 而 dir1 是伪 404（它下面任何路径都回
+    200）。此时 dir1/xx1、dir1/xx2 这些词表子目录全是无效访问，不该再扫；
+    但用户明确说了 dir1/dir2/dir3 存在，链必须继续。
+    """
+    counter = []
+
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path.split("?")[0])
+            path = self.path.split("?")[0].rstrip("/")
+            # /dir1 及其下所有路径一律 200（伪 404 区）
+            if path in ("", "/dir1") or path.startswith("/dir1/"):
+                return self._send(200, b"soft")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(H)
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "odfake_d.txt")
+    f = os.path.join(tmp, "odfake_f.txt")
+    with open(d, "w") as fh:
+        fh.write("xx1\nxx2\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    args = cli.Args(cli.build_parser().parse_args(
+        ["-u", url, "-d", d, "-f", f, "-t", "2", "-r", "5", "--timeout", "5",
+         "--od", "dir1/dir2/dir3/"]))
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    try:
+        eng.start()
+        wait_idle(st, timeout=60)
+    finally:
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    paths = [p for p in counter if p]
+    interesting = sorted(p for p in set(paths) if p.startswith("/dir1")
+                         or p.startswith("/xx"))
+    print("  dir1 伪 404；相关请求: %s" % interesting)
+    # 链照走：每层都被请求到
+    for want in ("/dir1", "/dir1/dir2", "/dir1/dir2/dir3"):
+        assert want in paths, "od 链断了，缺少 %s: %s" % (want, interesting)
+    # 伪 404 层的词表子目录不再扫
+    assert "/dir1/xx1" not in paths, interesting
+    assert "/dir1/xx2" not in paths, interesting
+    # 根目录的词表子目录照常扫（只有伪 404 的 dir1 被跳过）
+    assert "/xx1" in paths, interesting
+    # dir1 被 dircheck 判死，从结果里撤回
+    assert "dir1" in st.dead_dirs, st.dead_dirs
+    print("  test_od_fake_layer_skips_wordlist_children OK")
 
 
 def test_scan_starts_from_root_with_od():
@@ -901,10 +988,9 @@ def test_od_opens_when_root_probe_fails():
 
         def _handle(self):
             path = self.path.split("?")[0]
-            # 随机探测名（纯 8 位，无后缀）与备份探针一律断开连接
+            # 随机探测名（纯 8 位，无后缀）一律断开连接
             # -> 触发 ConnectionError，走 settle_failed_probe 结算
-            if (re.match(r"^/[a-z0-9]{8}$", path)
-                    or path.startswith("/__probe__")):
+            if re.match(r"^/[a-z0-9]{8}$", path):
                 self.close_connection = True
                 try:
                     self.connection.close()
@@ -1139,8 +1225,6 @@ def test_priority_classification():
         (Task("dir", "r", "", from_="dircheck"), PRIO_PROBE, "dircheck 探测"),
         (Task("file", "r.aspx", "", from_="suffixcheck"), PRIO_PROBE,
          "后缀探测"),
-        (Task("file", "__probe__ab.xy", "", from_="backup"), PRIO_PROBE,
-         "备份探针"),
         (Task("file", "db.zip", "", from_="backup"), PRIO_FILE, "备份文件"),
         (Task("dir", "a", "", from_="okdir"), PRIO_DIR, "--od 目录"),
         (Task("file", "a.zip", "", from_="backup_suffix"), PRIO_FILE,
@@ -1149,7 +1233,7 @@ def test_priority_classification():
     for task, expected, label in cases:
         got = task_priority(task)
         assert got == expected, "%s: 期望 %d 得到 %d" % (label, expected, got)
-    print("  8 种任务类型的优先级均正确")
+    print("  %d 种任务类型的优先级均正确" % len(cases))
     print("  test_priority_classification OK")
 
 
@@ -1647,7 +1731,7 @@ def test_od_command_adds_levels():
 
 def test_suffix_takes_last_dot():
     """后缀统一取最后一个点：.tar.gz 视为 .gz。"""
-    from pathscan.models import _match_backup_suffix, suffix_of
+    from pathscan.models import suffix_of
     from pathscan import probes
 
     cases = [
@@ -1664,14 +1748,11 @@ def test_suffix_takes_last_dot():
         print("  suffix_of(%-12r) -> %r" % (name, got))
         assert got == want, (name, got, want)
 
-    # 备份探针名也按同一规则归类
+    # 备份后缀表必须全是单点后缀，否则永远匹配不到（按最后一个点解析）
     d = {x: True for x in probes.BACKUP_SUFFIXES}
     print("  备份后缀表（只含单点后缀）: %d 个" % len(d))
     for suffix in d:
         assert suffix.count(".") == 1, "不应有多点后缀: %s" % suffix
-    assert _match_backup_suffix("db.tar.gz", d) == ".gz"
-    assert _match_backup_suffix("db.zip", d) == ".zip"
-    assert _match_backup_suffix("db.exe", d) is None
     print("  test_suffix_takes_last_dot OK")
 
 
@@ -1703,6 +1784,7 @@ def main():
         ("示例提示", test_error_shows_demos),
         ("--od 解析", test_ok_dirs_parsing),
         ("--od 跳过探测并递归", test_ok_dirs_skips_probe_and_recurses),
+        ("--od 伪404 层不扫词表", test_od_fake_layer_skips_wordlist_children),
         ("从根目录开始扫", test_scan_starts_from_root_with_od),
         ("common 先于 backup", test_common_released_before_backup),
         ("暂停丢弃在途日志", test_pause_discards_inflight_live_log),

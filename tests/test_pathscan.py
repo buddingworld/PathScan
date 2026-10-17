@@ -192,6 +192,172 @@ def test_normal_site():
     print("  test_normal_site OK")
 
 
+def test_no_empty_stem_paths():
+    """空文件名路径压根不该存在：admin/.zip 这种请求一个都不该发出。
+
+    来源是带尾斜杠的名字（``--ed "admin/"``、词表条目 ``admin/``、
+    ``ed admin/``）：目录命中后拼后缀就成了 ``admin/.zip``——文件名是空的，
+    只剩个后缀。生成器与入口都要归一化。
+    """
+    counter = []
+    existing = {"/admin": (200, b"admin"), "/admin/": (200, b"admin"),
+                "/admin/index.html": (200, b"i")}
+    srv, url = start_server(make_handler(existing, counter=counter))
+    try:
+        res, err, st, out = run_scan(
+            url, ["admin/", "/admin"], ["index/"],
+            extra=["-s", ".html", "-t", "2", "-r", "2", "--timeout", "5",
+                   "--ed", "admin/"])
+    finally:
+        srv.shutdown()
+
+    paths = [p.split("?")[0] for p in counter]
+    print("  请求数 %d，其中带空文件名段的: %s"
+          % (len(paths), [p for p in paths if _has_empty_stem(p)][:10]))
+    bad = [p for p in paths if _has_empty_stem(p)]
+    assert not bad, "不该存在空文件名路径: %s" % bad
+    # 正常路径照常扫到
+    urls = sorted(r["url"] for r in res)
+    assert url + "/admin" in urls, urls
+    assert url + "/admin/index.html" in urls, urls
+    print("  test_no_empty_stem_paths OK")
+
+
+def _has_empty_stem(path):
+    """路径里是否有「只有后缀、没有名字」的一段（admin/.zip）。"""
+    for seg in path.strip("/").split("/"):
+        if seg.startswith(".") and seg.count(".") == 1 and len(seg) > 1:
+            return True
+    return False
+
+
+def test_dead_dir_skips_its_probes():
+    """软 404 目录判定后，其下的后缀/备份探针不再发出。
+
+    现场的形态：/Login/error 命中，但它下面所有路径都返回 200（软 404）。
+    dircheck 判定该目录是软 404 之后，同批入队的后缀探针、备份探针必须
+    被跳过——否则会继续在一个已知的假目录里探测，报出「备份探针
+    Login/error/.zip 命中（-> 405），跳过 .zip 后缀的备份检测」这类假结论。
+
+    用 -t 1 保证顺序确定：探针按 dircheck -> 后缀探针 -> 备份探针入队，
+    单线程下 dircheck 先出结论，其余同批探针就该全部被拦下。
+    """
+    counter = []
+
+    class LoginError(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path)
+            path = self.path.split("?")[0].rstrip("/")
+            if path in ("", "/Login", "/Login/error"):
+                return self._send(200, b"real")
+            if path.startswith("/Login/error/"):
+                return self._send(200, b"soft404")     # 该目录下一切皆 200
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(LoginError)
+    try:
+        res, err, st, out = run_scan(
+            url, ["Login", "error"], ["x"],
+            extra=["-s", ".php", "-t", "1", "-r", "3", "--timeout", "5"])
+    finally:
+        srv.shutdown()
+
+    text = "\n".join(out)
+    print("  dead_dirs:", st.dead_dirs)
+    assert "Login/error" in st.dead_dirs, text
+    assert "Login/error 判定为软 404" in text, text
+
+    # 该目录下只应有 dircheck 那一次随机名请求，探针一条都不该再发
+    under = [p for p in counter if p.startswith("/Login/error/")]
+    print("  /Login/error/ 下的请求:", under)
+    assert len(under) == 1, "软 404 后不该继续扫该目录: %s" % under
+    # 也没有相应的假结论外泄
+    assert "备份探针 Login/error" not in text, text
+    assert "后缀 .php 在 Login/error" not in text, text
+    print("  test_dead_dir_skips_its_probes OK")
+
+
+def test_soft404_dir_withdraws_its_results():
+    """被 dircheck 判为软 404 的目录，要从结果里撤回。
+
+    现场形态：/Static/fonts 是真目录（它下面的随机名 404，dircheck 通过），
+    但子目录 /Static/fonts/zz 下所有路径都返回 200（catch-all）。
+    zz 命中时先记进结果，随后它自己的 dircheck 命中判成软 404 ——
+    此时必须把 zz 从结果里撤回并转入 Ignored Paths，否则报告里会列出
+    一堆「已被 dircheck 忽略」的子目录。
+    """
+    counter = []
+
+    class FontsCatchAll(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path)
+            path = self.path.split("?")[0].rstrip("/")
+            if path in ("", "/Static", "/Static/fonts", "/Static/fonts/zz"):
+                return self._send(200, b"real")
+            if path.startswith("/Static/fonts/zz/"):
+                return self._send(200, b"catch-all")   # zz 下一切皆 200
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(FontsCatchAll)
+    try:
+        res, err, st, out = run_scan(
+            url, ["Static", "fonts", "zz"], ["x"],
+            extra=["-t", "2", "-r", "5", "--timeout", "5"])
+    finally:
+        srv.shutdown()
+
+    text = "\n".join(out)
+    urls = sorted(r["url"] for r in res)
+    print("  results:", urls)
+    print("  dead_dirs:", st.dead_dirs)
+    assert "Static/fonts/zz" in st.dead_dirs, text
+    assert url + "/Static/fonts" in urls, urls
+    assert url + "/Static/fonts/zz" not in urls, \
+        "软 404 目录不该留在结果里: %s" % urls
+
+    report = "\n".join(output.format_report(st, _args_for(url)))
+    print("  --- 报告 ---")
+    for line in report.splitlines():
+        print("   |", line)
+    head, _, tail = report.partition("Result(OK):")
+    assert "/Static/fonts/zz" in head, "撤回的目录应转入 Ignored Paths: %s" % report
+    assert "/Static/fonts/zz" not in tail, "它不该再出现在 Result(OK): %s" % report
+    assert "撤回 1 条结果" in text, text
+    print("  test_soft404_dir_withdraws_its_results OK")
+
+
 def test_soft404_root_aborts():
     srv, url = start_server(make_handler({}, soft404=True))
     try:
@@ -234,6 +400,13 @@ def test_ir_applies_to_probes():
     assert "无法继续扫描，终止" not in text, text
     assert "/admin" in counter, "扫描应继续进行: %s" % counter[:20]
     assert not res, res
+    # 这种站点上几乎每个路径都命中规则：报告里一条都不该出现
+    assert not st.ignored, "被 --ir 忽略的路径不该留痕: %s" % st.ignored
+    report = "\n".join(output.format_report(st, _args_for(url)))
+    print("  --- 报告 ---")
+    for line in report.splitlines():
+        print("   |", line)
+    assert "Ignored Paths:\n    (none)" in report, report
     print("  test_ir_applies_to_probes OK")
 
 
@@ -280,9 +453,9 @@ def test_size_uses_bytes_not_chars():
 
 
 def test_no_bak_skips_backup_paths():
-    """--nb：不自动添加任何备份路径（备份文件、备份探针、目录自身备份）。
+    """--nb：不自动添加任何备份路径（备份文件、目录自身备份）。
 
-    同一靶机跑两次对照：默认会发备份探针、扫备份文件、追加目录自身备份；
+    同一靶机跑两次对照：默认会扫备份文件、追加目录自身备份；
     --nb 时这些请求一条都不发，常规扫描不受影响。
     """
     existing = {"/admin": (200, b"admin"), "/index.html": (200, b"i")}
@@ -300,7 +473,6 @@ def test_no_bak_skips_backup_paths():
 
     # 对照组：默认行为
     res0, url0, paths0 = scan(base)
-    assert [p for p in paths0 if "__probe__" in p], "默认应发备份探针"
     assert "/db.zip" in paths0, "默认应扫备份文件"
     assert "/admin.gz" in paths0, "默认应追加目录自身备份"
     assert url0 + "/admin" in [r["url"] for r in res0], res0
@@ -309,7 +481,6 @@ def test_no_bak_skips_backup_paths():
     # --nb：备份相关请求一条都不该出现
     res1, url1, paths1 = scan(base + ["--nb"])
     print("  --nb 请求数 %d: %s" % (len(paths1), paths1))
-    assert not [p for p in paths1 if "__probe__" in p], paths1
     bak_suffixes = tuple(probes.BACKUP_SUFFIXES + probes.DIR_BACKUP_SUFFIXES)
     assert not [p for p in paths1 if p.lower().endswith(bak_suffixes)], paths1
     assert url1 + "/admin" in [r["url"] for r in res1], res1
@@ -401,10 +572,10 @@ def test_suffix_lied_about():
 
 
 def test_ignore_rules():
-    """--ir 命中即等同 404：不进结果，也不会把报告刷爆。
+    """--ir 命中 = 普通 404：不记录、不递归、也不出现在报告里。
 
-    目录被忽略要留痕（否则整棵子树静默消失），文件与备份路径被忽略
-    属于常态，跟普通 404 一样不记录、不出现在报告里。
+    软 404 站点上大部分请求都会命中规则，一旦留痕，报告会被「全是 404」
+    的条目刷爆，而它们和一行业务 404 的 [err] 日志没有区别。
     """
     existing = {"/admin": (200, b"a" * 10), "/login": (200, b"b" * 99)}
     srv, url = start_server(make_handler(existing))
@@ -420,13 +591,13 @@ def test_ignore_rules():
     assert url + "/admin" in urls, urls
     assert url + "/login" not in urls, "--ir size 99 应把 login 判为 404"
 
+    # 命中的路径不落任何痕迹
+    assert not st.ignored, "被 --ir 忽略的路径不该留痕: %s" % st.ignored
     report = "\n".join(output.format_report(st, _args_for(url)))
     print("  --- 报告 ---")
     for line in report.splitlines():
         print("   |", line)
-    # 目录被忽略：留在报告的 Ignored Paths 里
-    assert "/login" in report, "被忽略的目录应留痕: %s" % report
-    # 文件 / 备份路径被忽略：报告里一条都不出现（当初一屏全是它们）
+    assert "/login" not in report, "被忽略的目录不该进报告: %s" % report
     assert "/db.zip" not in report, "被忽略的备份路径不该进报告: %s" % report
     assert "/index" not in report, "被忽略的文件不该进报告: %s" % report
     print("  test_ignore_rules OK")
@@ -654,6 +825,9 @@ def main():
         ("掩码引擎", test_mask_engine),
         ("正常站点", test_normal_site),
         ("软 404 终止", test_soft404_root_aborts),
+        ("软 404 目录下不再探测", test_dead_dir_skips_its_probes),
+        ("软 404 目录从结果撤回", test_soft404_dir_withdraws_its_results),
+        ("空文件名路径不存在", test_no_empty_stem_paths),
         ("--ir 作用于探针", test_ir_applies_to_probes),
         ("size 用字节数", test_size_uses_bytes_not_chars),
         ("--nb 不扫备份", test_no_bak_skips_backup_paths),

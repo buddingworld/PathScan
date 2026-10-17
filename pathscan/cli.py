@@ -96,9 +96,9 @@ _EPILOG = """
 --ti  线程内请求间隔，可用区间表示随机
        --ti 0.5      --ti 1-3
 
---ir  把匹配的响应判定为 404：不改结果、不递归，也不进最终报告。
-      目录命中会在报告的 Ignored Paths 里留痕，文件/备份路径与普通
-      404 一样只在实时日志里留一行。可多次，属性：%s
+--ir  把匹配的响应判定为 404，与普通 404 完全一致：不记录结果、
+      不递归、不进最终报告，只在实时日志里留一行 [err]。
+      可多次，属性：%s
        --ir size 1234            固定长度
        --ir code 500-599         状态码区间
        --ir grep "not found"     响应体正则
@@ -109,10 +109,15 @@ _EPILOG = """
        --br name logout          名称含 logout
        --br path /static/        路径含 /static/
 
---nb  不自动添加备份路径探测（备份文件、备份探针、目录自身备份）
+--nb  不自动添加备份路径（备份文件、目录自身备份）
        --nb
        注：词表里标注了 waf 的目录，其自身备份始终跳过（备份名带着
        同一个敏感串，扫了只会触发同一条 WAF 规则）
+
+--od  已确认存在的目录，逐层登记并参与递归
+       --od dir1/dir2/dir3/
+       每层只发一次 dircheck：伪 404 的层不展开它的词表子目录，
+       但链继续往下走（dir1 是假的也不影响 dir2、dir3）
 
 --proxy  代理
        --proxy http://127.0.0.1:8081
@@ -246,8 +251,7 @@ def build_parser():
                    help="排除路径规则，可多次。ATTR: %s" % _BR_ATTRS)
     g.add_argument("--nb", "--no-bak", dest="nb", action="store_true",
                    help="不自动添加备份路径：不扫备份文件（名称×后缀）、"
-                        "不发备份探针、也不追加目录自身备份。词表里手写的"
-                        "备份名不受影响")
+                        "也不追加目录自身备份。词表里手写的备份名不受影响")
 
     g = p.add_argument_group("输出")
     g.add_argument("--of", "--output-file", dest="of", metavar="FILE",
@@ -255,8 +259,9 @@ def build_parser():
     g.add_argument("--od", "--ok-dirs", dest="od", action="append",
                    metavar="PATH",
                    help="已确认存在的目录，形如 dir1/dir2/dir3/。每一层都会"
-                        "被直接判定为存在（不经过探测），并与其他目录一起"
-                        "参与递归。可多次")
+                        "被登记为存在并参与递归；每层只发一次 dircheck，"
+                        "伪 404 的层不展开它的词表子目录（链继续往下走）。"
+                        "可多次")
     g.add_argument("--cq", "--quiet", dest="quiet", action="store_true",
                    help="安静模式：不输出实时日志，只保留最终报告")
     g.add_argument("--debug", dest="debug", action="store_true",
@@ -308,10 +313,10 @@ class Args(object):
         self.ed_list = []
         self.ef_list = []
         try:
-            self.ed_list = maskmod.expand_specs(self.ed, self.custom_charsets,
-                                                self.connectors)
-            self.ef_list = maskmod.expand_specs(self.ef, self.custom_charsets,
-                                                self.connectors)
+            self.ed_list = _clean_names(maskmod.expand_specs(
+                self.ed, self.custom_charsets, self.connectors))
+            self.ef_list = _clean_names(maskmod.expand_specs(
+                self.ef, self.custom_charsets, self.connectors))
         except maskmod.MaskError as exc:
             self.mask_error = str(exc)
 
@@ -320,6 +325,21 @@ class Args(object):
             return []
         # 空串是隐含的，这里只保留显式给出的连接符
         return [c for c in maskmod.split_top_level(self.csc) if c != ""]
+
+
+def _clean_names(names):
+    """去掉名字两端的斜杠，并丢弃清空后的项。
+
+    掩码展开会原样保留用户写法，``--ed "admin/"`` 得到的就是 ``admin/``；
+    带着尾斜杠进队列，目录命中后加后缀会拼出 ``admin/.zip`` 这种空文件名
+    路径。归一化放在入口，后面所有生成器都不必再防。
+    """
+    out = []
+    for name in names:
+        name = str(name).strip("/")
+        if name:
+            out.append(name)
+    return out
 
 
 def parse_ok_dirs(values):
@@ -484,6 +504,9 @@ def load_wordlist(path, kind):
                         remark = remark_raw
                 else:
                     remark = remark_raw
+            # 两端的斜杠去掉：条目写成 ``admin/`` 时，加后缀会拼出
+            # ``admin/.zip`` 这种空文件名路径，压根不该发出去
+            name = name.strip("/")
             if not name:
                 continue
             entries.append({

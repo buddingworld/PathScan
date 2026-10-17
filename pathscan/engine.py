@@ -81,8 +81,16 @@ class Worker(threading.Thread):
 
         url = build_url(args.url, task.path, task.type, args.mode)
 
-        # 目录本身或其上级已被判 404，直接跳过
-        if task.type == "dir" and task.parent and state.is_dead_dir(task.parent):
+        # 目录本身或其上级已被判 404：其下所有任务都不再发，探测也一样。
+        # 探测被跳过时必须结算，否则该目录的延迟组永远等不到放行而卡住扫描。
+        # 少了这一步，dircheck 判定软 404 之后，同批入队的后缀探针
+        # 还会在一个已知的假目录里继续探，报出一堆假结论。
+        # od 声明的路径例外：用户说了 dir1/dir2/dir3 存在，dir1 伪 404
+        # 不该连累 dir2，链上的层照常请求。
+        if (task.parent and state.is_dead_dir(task.parent)
+                and task.path not in state.od_paths):
+            if self.is_probe(task):
+                engine.settle_failed_probe(task)
             return
         # 该目录下这个后缀被判定为不可用
         if task.type == "file" and args.suffixes:
@@ -97,7 +105,7 @@ class Worker(threading.Thread):
 
         # ---- 网络层失败：重试 ----
         if resp.error is not None:
-            self.live(task, url, False)
+            self.live(task, url, False)         # 没有状态码，标记为 [err]
             self.note_request_result(False)
             engine.waf_watch(task)          # 失败累计到阈值则纳入观察
             task.trytimes += 1
@@ -126,29 +134,34 @@ class Worker(threading.Thread):
             if rule is not None:
                 resp.mark_ignored()
                 engine.debug("探针 %s 被 --ir 判为 404，按未命中结算" % url)
+            # 同批探测里 dircheck 先回来、把该目录判成了软 404：这个在途探测
+            # 的结论已经没有意义（延迟组整组作废），静默结算即可，别再报
+            # 「命中 / 跳过」误导用户；根目录被判死时同样能省掉终止后的噪声。
+            if state.is_dead_dir(task.parent):
+                engine.settle_failed_probe(task)
+                return
             if task.from_ == "dircheck":
                 engine.on_dircheck_result(task, url, resp)
-            elif task.from_ == "suffixcheck":
-                engine.on_suffix_result(task, url, resp)
             else:
-                engine.on_backup_probe_result(task, url, resp)
+                engine.on_suffix_result(task, url, resp)
             # 根目录探测结算完就可以登记 --od 目录了
             engine.maybe_open_ok_dirs()
             return
 
-        # ---- 忽略规则：判定为 404，不递归；只有目录会记入报告 ----
+        # ---- 忽略规则：判定为 404，与普通 404 完全一致 ----
+        # 命中规则的路径不记录结果、不递归，也**不进最终报告**：软 404 站点上
+        # 大部分请求都命中规则，列出来只会把报告刷爆，而它传达的信息和
+        # 一行 [404] 没有区别。--debug 时才另打一行诊断。
         rule = engine.ignore_rules.matched(resp._resp, resp.code, resp.size)
         if rule is not None:
             reason = "--ir %s %s" % (rule["attr"], rule["raw"])
-            self.live(task, url, False)
-            state.add_ignored(task, url, resp.code, resp.size,
-                              resp.location, reason)
+            self.live(task, url, False, resp.code)
             engine.debug("忽略 %s (%s)" % (url, reason))
             return
 
         exists = resp.exists
         if not exists:
-            self.live(task, url, False)
+            self.live(task, url, False, resp.code)
             return
 
         # ---- 命中 ----
@@ -167,7 +180,7 @@ class Worker(threading.Thread):
         if not state.add_result(rec):
             # 去重命中（同一个 url+type 已经记录过），不重复打日志
             return
-        self.live(task, url, True)
+        self.live(task, url, True, resp.code)
         if task.waf:
             state.waf_hit(task.name, task.waf)
 
@@ -177,20 +190,21 @@ class Worker(threading.Thread):
 
     @staticmethod
     def is_probe(task):
-        """是否是探测任务（dircheck / 后缀检测 / 备份探针）。"""
-        if task.from_ in ("dircheck", "suffixcheck"):
-            return True
-        return task.from_ == "backup" and task.name.startswith("__probe__")
+        """是否是探测任务（dircheck / 后缀检测）。"""
+        return task.from_ in ("dircheck", "suffixcheck")
 
-    def live(self, task, url, ok):
-        """打一条实时日志（带速度与备注）。只输出到屏幕，不写 --of。
+    def live(self, task, url, ok, code=None):
+        """打一条实时日志（带状态码、速度与备注）。只输出到屏幕，不写 --of。
+
+        code 为 None 表示网络层失败，此时标记为 [err]；有状态码就显示
+        状态码本身（[200] / [404]），比笼统的 [err] 有用得多。
 
         remark 的显示门控在 Printer.live_line 里（只在 ok 时显示），
         这里照常把备注传进去即可。
         """
         self.engine.printer.live_line(self.thread_id, task.path, ok,
                                       self.engine.state.speed(),
-                                      self.engine.remark_for(task))
+                                      self.engine.remark_for(task), code)
 
     # ------------------------------------------------------------------
     # 线程健康度：连续失败则惩罚性暂停，必要时转 WAF 等待模式
@@ -349,6 +363,9 @@ class Engine(object):
             # WAF 自动检测加入忽略列表的名称，后续不再检测
             if state.is_name_bypassed(task.name):
                 continue
+            # 上级目录被拉黑/忽略：整棵子树都不再发请求
+            if state.path_under_blocked(path):
+                continue
             accepted.append(task)
         return accepted
 
@@ -417,7 +434,10 @@ class Engine(object):
         # --od 指定的目录要等根目录结算后再打开，否则它们会插到根目录任务的
         # 前面——根目录任务在等探测，--od 任务却立即放行，扫描就从
         # /tc 而不是 / 开始了。
+        # 等根目录结算后再打开 --od 目录：它们要先登记进 od 链，
+        # 链上的层才不会被别的软 404 判定挡住。
         self._ok_dirs_pending = list(args.ok_dirs)
+        self.state.od_paths.update(args.ok_dirs)
         self._ok_dirs_done = not self._ok_dirs_pending
         self.maybe_open_ok_dirs()
 
@@ -474,22 +494,34 @@ class Engine(object):
 
         走正常流程：探测 -> 结算 -> 递归展开，所以新目录和词表来的
         目录行为完全一致。已存在的结果不受影响。
+
+        名字两端的斜杠先去掉：``ed admin/`` 这种写法会带着尾斜杠进来，
+        命中后加后缀会拼出 ``admin/.zip`` 这种空文件名路径。
         """
+        name = str(name).strip("/")
+        if not name:
+            return 0
         task = Task(type="dir", name=name, parent=parent, from_="ed")
         return self.add_tasks([task])
 
     def add_ok_dir(self, path):
         """把一个目录认定为已存在并加入递归（od 指令用）。返回是否新增。
 
-        与启动时 --od 的处理一致：请求目录自身 + 跳过探测直接打开递归。
-        已经处理过的层会被 claim_dir 挡下，不会重复。
+        与启动时 --od 的处理一致：请求目录自身 + 登记递归。已经处理过的层
+        会被 claim_dir 挡下，不会重复。
+
+        od 链上的层即使被自己的 dircheck 判成软 404，也要继续往下打开：
+        用户明确说了 dir1/dir2/dir3 存在，dir1 是伪 404 不该连累 dir2。
+        被跳过的是该层自己的词表子目录（由延迟组统一作废）。
         """
-        if self.state.is_dead_dir(path):
-            self.debug("od 跳过 %r：已被判为软 404" % path)
+        dead = self._dead_ancestor_outside_od(path)
+        if dead is not None:
+            self.debug("od 跳过 %r：%r 已被判为软 404" % (path, dead))
             return False
         if path in self.state.opened:
             self.debug("od 跳过 %r：已登记过" % path)
             return False
+        self.state.od_paths.add(path)
         # 先占去重名额，保证 od 的写法优先于词表里的大小写变体
         self.state.claim_url(path, "dir", bool(self.args.cs))
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
@@ -501,15 +533,33 @@ class Engine(object):
         self.debug("od 认定存在并加入递归 %r" % path)
         return True
 
+    def _dead_ancestor_outside_od(self, path):
+        """path 自身或某个上级被判软 404，且该层不在 od 链上。返回该层。
+
+        od 声明的层是用户明确指定存在的，被判软 404 也不阻断链：
+        ``--od dir1/dir2/dir3`` 里 dir1 伪 404 时，dir2 仍要继续扫。
+        只有链外的上级被判死（例如根目录整体是软 404）才放弃。
+        """
+        state = self.state
+        with state.lock:
+            if not state.dead_dirs:
+                return None
+            for anc in [path] + ancestors(path):
+                if anc in state.dead_dirs and anc not in state.od_paths:
+                    return anc
+        return None
+
     def open_dir(self, dirpath, is_root=False, assume_ok=False):
         """登记一个新目录：先发探测，探测出结论后再放行常规任务。
 
-        探测包括三种：dircheck（是否软 404）、后缀检测（每个 -s 后缀各一次）、
-        备份探针（随机备份名）。常规任务全部暂存在延迟组里，等探测结算——
-        否则备份的上千个任务会在后缀结论出来之前就被扫掉。
+        探测包括两种：dircheck（是否软 404）与后缀检测（每个 -s 后缀各一次）。
+        常规任务全部暂存在延迟组里，等探测结算——否则备份的上千个任务会在
+        后缀结论出来之前就被扫掉。
 
-        assume_ok 为 True 时（--od 指定的目录）跳过所有探测，直接按
-        「目录存在、后缀全部可用」结算并立刻放行任务。
+        assume_ok 为 True 时（--od / od 指令指定的目录）跳过后缀探测，
+        但仍发一次 dircheck：od 路径也可能落在伪 404 区里，那种目录不该
+        把整份词表都扫一遍。结论只决定「要不要展开它的词表子目录」，
+        od 链本身照走（见 _dead_ancestor_outside_od）。
 
         每个目录只登记一次（state.claim_dir 保证）。
         """
@@ -534,11 +584,17 @@ class Engine(object):
                                               Task("dir", "", dirpath))))
             state.put_group(dirpath, "backup", backup)
 
-        # --od：已知存在，不走探测，直接按「存在 + 后缀全可用」结算放行
+        # --od：用户已确认这层存在，后缀全按可用处理，但仍探一次 dircheck。
+        # 伪 404 区里的 od 路径（dir1 命中但 dir1/xx1、dir1/xx2 全是假 200）
+        # 不该把整份词表都扫一遍；结论只作废它的词表子目录，od 链照走。
         if assume_ok:
+            task = probes.make_dircheck_task(dirpath)
             state.register_probes(dirpath, 1)
-            state.note_verdict(dirpath, "dead", value=False)
-            self.debug("--od 直接放行目录 %r（常规 %d / 备份 %d）"
+            if not self.add_tasks([task], "probe"):
+                # 探针没入队（被 --br / 去重拦下）就即时结算，
+                # 否则这层的延迟组永远等不到放行
+                state.note_verdict(dirpath, "dead", value=False)
+            self.debug("--od 登记目录 %r（常规 %d / 备份 %d），待 dircheck 放行"
                        % (dirpath, len(common), len(backup)))
             return
 
@@ -562,11 +618,6 @@ class Engine(object):
             if pending_suffixes:
                 probe_tasks.extend(
                     probes.make_suffix_probe_tasks(dirpath, pending_suffixes))
-
-        # 每个备份后缀各探一次，判断该后缀的备份是否被服务器一律放行
-        if not args.nb:
-            probe_tasks.extend(
-                probes.make_backup_probe_tasks(dirpath, probes.BACKUP_SUFFIXES))
 
         # 注册「还要等几个探测结论」：入队数 + 走缓存直接结算的那几个。
         # 用实际入队数而不是构造数，避免被 --br / 去重拦下的探针永远等不到。
@@ -598,6 +649,10 @@ class Engine(object):
         parent = task.parent
         if resp.exists:
             state.note_verdict(parent, "dead")
+            # 该目录（及其下所有路径）此前记录的命中都是这个假目录的产物，
+            # 撤回并转入 Ignored Paths —— 否则它们会以「存在」的姿态留在
+            # 结果里，用户会看到一堆已被 dircheck 判死的子目录。
+            withdrawn = state.withdraw_dead_results(parent)
             if parent == "":
                 self.printer.raw("!")
                 self.printer.raw("! 根目录探测命中：目标对任意路径都返回 %s"
@@ -614,8 +669,11 @@ class Engine(object):
                 with state.lock:
                     state.cond.notify_all()
             else:
-                self.printer.info("目录 %s 判定为软 404（%s -> %s），跳过其下所有路径"
-                                  % (parent, url, resp.code), tag="!")
+                msg = ("目录 %s 判定为软 404（%s -> %s），跳过其下所有路径"
+                       % (parent, url, resp.code))
+                if withdrawn:
+                    msg += "，撤回 %d 条结果" % withdrawn
+                self.printer.info(msg, tag="!")
         else:
             state.note_verdict(parent, "dead", value=False)
             self.debug("dircheck 通过 %s -> %s" % (parent or "/", resp.code))
@@ -636,26 +694,6 @@ class Engine(object):
                        % (task.parent and task.parent + "/", suffix))
         state.note_verdict(task.parent, "ext", suffix, usable)
 
-    def on_backup_probe_result(self, task, url, resp):
-        """备份探针命中 => 该后缀的备份被服务器一律放行，跳过这个后缀。
-
-        逐后缀判定：只作废命中的那个后缀，其他后缀照常扫。
-        """
-        state = self.state
-        suffix = probes.backup_suffix_of(task.name, probes.BACKUP_SUFFIXES)
-        if suffix is None:
-            self.debug("备份探针 %s 无法识别后缀，按通过处理" % task.name)
-            return
-        value = not resp.exists
-        if resp.exists:
-            self.printer.info("备份探针 %s%s 命中（-> %s），跳过 %s 后缀的备份检测"
-                              % (task.parent and task.parent + "/", suffix,
-                                 resp.code, suffix), tag="!")
-        else:
-            self.debug("备份探针通过 %s%s"
-                       % (task.parent and task.parent + "/", suffix))
-        state.note_verdict(task.parent, "backup", suffix, value)
-
     def settle_failed_probe(self, task):
         """探测任务重试超限后，按「结论未知」结算，放行该目录的任务。
 
@@ -672,13 +710,6 @@ class Engine(object):
             suffix = suffix_of(task.name)
             if suffix is not None:
                 self.state.note_verdict(task.parent, "ext", suffix, True)
-        elif task.name.startswith(probes.PROBE_PREFIX):
-            # 探测失败时保守放行该后缀：少扫的风险大于多扫
-            suffix = probes.backup_suffix_of(task.name, probes.BACKUP_SUFFIXES)
-            if suffix is not None:
-                self.state.note_verdict(task.parent, "backup", suffix, True)
-            else:
-                self.state.note_verdict(task.parent, "backup", None, True)
         # 这条路径不走 handle 的 is_probe 分支，得自己检查 --od 能否登记，
         # 否则根目录探测失败时 --od 目录永远不打开，整棵子树静默漏扫。
         self.maybe_open_ok_dirs()
