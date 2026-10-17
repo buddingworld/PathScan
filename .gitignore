@@ -10,8 +10,3 @@ tests/_tmp/
 # 随便改不会被 push，也不会出现在 git status 里。
 testd.txt
 testf.txt
-
-# 根目录下的词表（d.txt / f.txt / file.txt / pinyinpinyin.txt ...）：
-# 属于本地数据，各机器自行准备，push / pull 都不再涉及。
-# 已经跟踪过的文件用 git rm --cached 摘出跟踪，本地文件保留。
-/*.txt
