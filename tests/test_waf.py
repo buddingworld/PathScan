@@ -843,6 +843,88 @@ def test_od_fake_layer_skips_wordlist_children():
     print("  test_od_fake_layer_skips_wordlist_children OK")
 
 
+def test_od_segments_join_ed_list():
+    """--od dir1/dir2/dir3 的每一段也会进 --ed 列表。
+
+    段名按 --ed 语义在根目录下各测一次（探测 + 递归），且不与 od 链
+    自身的请求重复。
+    """
+    counter = []
+
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            counter.append(self.path.split("?")[0])
+            path = self.path.split("?")[0].rstrip("/")
+            # dir2 在根目录下也真实存在（词表里没有它，只能靠 --ed 段名发现）
+            if path in ("", "/dir1", "/dir1/dir2", "/dir1/dir2/dir3", "/dir2"):
+                return self._send(200, b"ok")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(H)
+    tmp = os.path.join(HERE, "_tmp")
+    if not os.path.isdir(tmp):
+        os.makedirs(tmp)
+    d = os.path.join(tmp, "odseg_d.txt")
+    f = os.path.join(tmp, "odseg_f.txt")
+    with open(d, "w") as fh:
+        fh.write("nothing\n")
+    with open(f, "w") as fh:
+        fh.write("x\n")
+
+    argv = ["-u", url, "-d", d, "-f", f, "-t", "2", "-r", "4", "--timeout", "5",
+            "--od", "dir1/dir2/dir3/"]
+    args = cli.Args(cli.build_parser().parse_args(argv))
+    print("  ed_list:", args.ed_list)
+    for seg in ("dir1", "dir2", "dir3"):
+        assert seg in args.ed_list, args.ed_list
+
+    de, _ = cli.load_wordlist(d, "dir")
+    fe, _ = cli.load_wordlist(f, "file")
+    printer = Cap()
+    st = GlobalState(args)
+    eng = engine.build(args, st, printer, rules.IgnoreRules([]),
+                       rules.BypassRules([]), rules.CaseFilter(1), de, fe, [])
+    try:
+        eng.start()
+        wait_idle(st, timeout=60)
+    finally:
+        st.pause_event.set()
+        with st.lock:
+            st.cond.notify_all()
+        for w in eng.workers:
+            w.join(timeout=3.0)
+        srv.shutdown()
+
+    by = {r["path"]: r for r in st.results}
+    print("  结果:", sorted(by))
+    # 根目录下的 dir2 被 --ed 段名发现
+    assert "dir2" in by, sorted(by)
+    # od 链本身照常
+    for want in ("dir1", "dir1/dir2", "dir1/dir2/dir3"):
+        assert want in by, "%s 缺失: %s" % (want, sorted(by))
+    # 不重复请求：dir1 只发一次
+    assert counter.count("/dir1") == 1, counter
+    print("  test_od_segments_join_ed_list OK")
+
+
 def test_scan_starts_from_root_with_od():
     """--od 不能让扫描只扫 /tc：根目录的词表项也要被扫到。
 
@@ -1782,6 +1864,7 @@ def main():
         ("--od 解析", test_ok_dirs_parsing),
         ("--od 跳过探测并递归", test_ok_dirs_skips_probe_and_recurses),
         ("--od 伪404 层不扫词表", test_od_fake_layer_skips_wordlist_children),
+        ("--od 段名并入 --ed", test_od_segments_join_ed_list),
         ("从根目录开始扫", test_scan_starts_from_root_with_od),
         ("common 先于 backup", test_common_released_before_backup),
         ("暂停丢弃在途日志", test_pause_discards_inflight_live_log),

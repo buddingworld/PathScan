@@ -281,7 +281,8 @@ def test_dead_dir_skips_its_probes():
     text = "\n".join(out)
     print("  dead_dirs:", st.dead_dirs)
     assert "Login/error" in st.dead_dirs, text
-    assert "dir Login/error is a soft 404" in text, text
+    assert re.search(r"! /Login/error soft 404 for /Login/error/\w+ "
+                     r"code:200 len:\d+", text), text
 
     # 该目录下只应有 dircheck 那一次随机名请求，探针一条都不该再发
     under = [p for p in counter if p.startswith("/Login/error/")]

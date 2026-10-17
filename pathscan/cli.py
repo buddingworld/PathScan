@@ -122,7 +122,8 @@ Options and examples
        --od dir1/dir2/dir3/
        Each level gets one dircheck: a fake 404 level does not expand its
        wordlist children, but the chain continues (a fake dir1 does not
-       stop dir2 or dir3).
+       stop dir2 or dir3). Every path segment also joins --ed, so dir1 /
+       dir2 / dir3 are tested at the root as ordinary directories.
 
 --proxy  proxy
        --proxy http://127.0.0.1:8081
@@ -271,7 +272,8 @@ def build_parser():
                         "Each level is registered and recursed; each level "
                         "gets one dircheck, and a fake 404 level does not "
                         "expand its wordlist children (the chain continues). "
-                        "Repeatable")
+                        "Each path segment is also added to --ed, so dir1 / "
+                        "dir2 / dir3 are tested at the root too. Repeatable")
     g.add_argument("--cq", "--quiet", dest="quiet", action="store_true",
                    help="quiet mode: no live log, only the final report")
     g.add_argument("--debug", dest="debug", action="store_true",
@@ -330,6 +332,12 @@ class Args(object):
                 self.ef, self.custom_charsets, self.connectors))
         except maskmod.MaskError as exc:
             self.mask_error = str(exc)
+        # --od 的每一段名字也按 --ed 追加：--od dir1/dir2/dir3 时，dir1、
+        # dir2、dir3 各自也会在根目录下当普通目录测一次（探测 + 递归）。
+        for path in self.ok_dirs:
+            for seg in path.split("/"):
+                if seg and seg not in self.ed_list:
+                    self.ed_list.append(seg)
 
     def _parse_connectors(self):
         if self.csc is None:

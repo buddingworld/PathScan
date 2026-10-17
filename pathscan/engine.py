@@ -528,7 +528,11 @@ class Engine(object):
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
         task = Task(type="dir", name=path.rsplit("/", 1)[-1], parent=parent,
                     from_="okdir")
-        if self.filter_tasks([task]):
+        # 该名字已在 --ed 列表里（--od 的段名会自动并进去）时不重复发请求：
+        # 那条 --ed 任务会照常请求这个路径，且走完整的探测与递归。
+        if path in self.args.ed_list:
+            self.debug("od %r 已由 --ed 覆盖，不再单独请求" % path)
+        elif self.filter_tasks([task]):
             self.state.enqueue([task])
         self.open_dir(path, assume_ok=True)
         self.debug("od registered %r as existing, recursing" % path)
@@ -670,8 +674,10 @@ class Engine(object):
                 with state.lock:
                     state.cond.notify_all()
             else:
-                msg = ("dir %s is a soft 404 (%s -> %s), skipping everything "
-                       "under it" % (parent, url, resp.code))
+                # 一行说清：哪个目录被判定为软 404、依据是哪次探测、
+                # 服务器回的什么。完整 URL 在这里是噪音，路径足够定位。
+                msg = ("/%s soft 404 for /%s code:%s len:%s"
+                       % (parent, task.path, resp.code, resp.size))
                 if withdrawn:
                     msg += ", withdrew %d result(s)" % withdrawn
                 self.printer.info(msg, tag="!")
