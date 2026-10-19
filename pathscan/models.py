@@ -358,6 +358,12 @@ class GlobalState(object):
         self.groups = {}                   # dirpath -> {key: [Task]}
         self.probe_wait = {}               # dirpath -> 未完成的探测数
         self.verdicts = {}                 # dirpath -> {"dead":bool,"exts":{suf:bool}}
+        # 探测健康度：用来判断「同一目录的探针是不是全挂了」（网络问题，
+        # 而不是「这些后缀都不可信」）。
+        self.probe_total = {}              # dirpath -> 本轮登记的探针数
+        self.probe_failed = {}             # dirpath -> 网络层失败的探针数
+        self.ext_failed = set()            # (dirpath, suffix) 因失败判为不可信
+        self.notices = []                  # 结算时产生的一次性提示
 
         # ---- WAF 与过滤 ----
         self.name_waf_count = {}           # name -> 命中次数（失败与「正常」都算）
@@ -597,7 +603,57 @@ class GlobalState(object):
         """
         with self.lock:
             self.probe_wait[dirpath] = count
+            self.probe_total[dirpath] = count
+            self.probe_failed.pop(dirpath, None)
             self.verdicts.setdefault(dirpath, {"dead": False, "exts": {}})
+
+    def note_probe_failure(self, dirpath):
+        """记一次探测的网络层失败（用于「整批探针全挂」的判断）。"""
+        with self.lock:
+            self.probe_failed[dirpath] = self.probe_failed.get(dirpath, 0) + 1
+
+    def mark_ext_failed(self, dirpath, suffix):
+        """标记这个后缀的「不可信」结论来自探测失败，而不是探测命中。
+
+        只有这类结论才会在「整批探针全挂」时被撤销——真正命中（403 / 万能
+        200）得出的结论与网络无关，必须保留。
+        """
+        with self.lock:
+            self.ext_failed.add((dirpath, suffix))
+
+    def pop_notices(self):
+        """取走结算期间产生的一次性提示（由 engine 打印）。"""
+        with self.lock:
+            out = self.notices
+            self.notices = []
+            return out
+
+    def _resolve_ext_failures(self, dirpath, verdict):
+        """探针整批失败 => 网络问题，撤销由此得出的「不可信」结论。
+
+        判据是「该目录登记的探针一个都没成功」：那说明网络/目标本身不通，
+        把结论记成「这些后缀都不可信」会让整棵子树的文件任务被静默跳过。
+        只要还有探针成功过，失败就说明是那个后缀被服务器单独掐了，照旧
+        判不可信。
+
+        调用方必须已持有 self.lock（note_verdict 内部）。
+        """
+        total = self.probe_total.pop(dirpath, 0)
+        failed = self.probe_failed.pop(dirpath, 0)
+        pairs = [p for p in self.ext_failed if p[0] == dirpath]
+        if not pairs:
+            return
+        all_failed = total > 0 and failed >= total
+        for pair in pairs:
+            self.ext_failed.discard(pair)
+            if not all_failed:
+                continue
+            self.ext_probe[pair] = True
+            verdict["exts"][pair[1]] = True
+        if all_failed:
+            self.notices.append(
+                "all probes under %s failed, treating it as a network "
+                "problem, suffix verdicts cleared" % (dirpath or "/"))
 
     def note_verdict(self, dirpath, kind, key=None, value=None):
         """记录一条探测结论。返回本次结算后要放行的任务列表（可能为空）。
@@ -622,6 +678,8 @@ class GlobalState(object):
             if self.probe_wait[dirpath] > 0:
                 return []
             self.probe_wait.pop(dirpath, None)
+            # 整批探针全挂时撤销「不可信」结论，必须在放行延迟组之前完成
+            self._resolve_ext_failures(dirpath, verdict)
 
             groups = self.groups.pop(dirpath, None)
             if not groups:

@@ -288,6 +288,132 @@ def test_backup_suffix_goes_through_suffix_detection():
     print("  test_backup_suffix_goes_through_suffix_detection OK")
 
 
+def test_suffix_probe_failure_marks_untrustworthy():
+    """后缀探针被断连（网络层失败）时，同样判该后缀不可信。
+
+    现场形态：WAF 对 .log 不是回 403，而是直接掐断连接。探针重试超限后
+    必须把 .log 标成不可信，否则 db.log、web.log 会一直重试、一直撞墙。
+    """
+    counter = []
+
+    class DropLog(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            path = self.path.split("?")[0]
+            counter.append(path)
+            if path.endswith(".log"):
+                # 直接断连，模拟 WAF 掐线
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
+            if path.rstrip("/") == "":
+                return self._send(200, b"root")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(DropLog)
+    try:
+        res, err, st, out = run_scan(
+            url, ["admin"], ["index"],
+            extra=["-t", "3", "-r", "1", "--timeout", "5", "--rt", "0"])
+    finally:
+        srv.shutdown()
+
+    text = "\n".join(out)
+    paths = [p.split("?")[0] for p in counter]
+    logs = [p for p in paths if p.endswith(".log")]
+    print("  .log 请求:", logs, "共", len(logs))
+    assert re.search(r"! suffix \.log under /: probe failed \(.+?\)", text), text
+    # 不是「整批全挂」，所以结论保留：.log 判为不可信
+    assert st.ext_probe.get(("", ".log")) is False, st.ext_probe
+    # 探针只发一次（--rt 0 不重试），之后的备份 .log 一条都不发
+    assert len(logs) == 1, logs
+    assert "/db.log" not in paths and "/admin.log" not in paths, paths
+    # 其它后缀的备份照常扫
+    assert [p for p in paths if p.endswith(".zip")], paths[:20]
+    print("  test_suffix_probe_failure_marks_untrustworthy OK")
+
+
+def test_all_probes_failed_is_network_problem():
+    """同一目录的探针全挂时按网络问题处理，不判后缀不可信。
+
+    靶机把所有探测请求（8 位随机名，带不带后缀都算）掐断，常规路径正常。
+    此时若把探针失败当成「这些后缀都不可信」，该目录下的文件任务会被整批
+    静默跳过——所以必须撤销这些结论，让常规扫描照常发出去。
+    """
+    counter = []
+
+    class DropProbes(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            path = self.path.split("?")[0]
+            counter.append(path)
+            name = path.rstrip("/").rsplit("/", 1)[-1]
+            # 探测名：8 位随机小写字母数字，可能再跟一个后缀
+            if re.match(r"^[a-z0-9]{8}(\.[a-z0-9]+)?$", name):
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
+            if path.rstrip("/") == "":
+                return self._send(200, b"root")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(DropProbes)
+    try:
+        res, err, st, out = run_scan(
+            url, ["admin"], ["index"],
+            extra=["-t", "8", "-r", "1", "--timeout", "5", "--rt", "0"])
+    finally:
+        srv.shutdown()
+
+    text = "\n".join(out)
+    paths = [p.split("?")[0] for p in counter]
+    print("  请求数 %d，其中词表项: %s"
+          % (len(paths), [p for p in paths if p in ("/admin", "/index")]))
+    assert "all probes under / failed, treating it as a network problem, " \
+           "suffix verdicts cleared" in text, text
+    # 结论已撤销：没有哪个后缀被标成不可信
+    assert not [k for k, v in st.ext_probe.items() if v is False], st.ext_probe
+    # 文件任务照常发出去（不是被静默跳过）
+    assert "/admin" in paths and "/index" in paths, paths
+    print("  test_all_probes_failed_is_network_problem OK")
+
+
 def test_dead_dir_skips_its_probes():
     """软 404 目录判定后，其下的后缀/备份探针不再发出。
 
@@ -884,6 +1010,8 @@ def main():
         ("软 404 终止", test_soft404_root_aborts),
         ("软 404 目录下不再探测", test_dead_dir_skips_its_probes),
         ("备份后缀过后缀检测", test_backup_suffix_goes_through_suffix_detection),
+        ("后缀探针断连也判不可信", test_suffix_probe_failure_marks_untrustworthy),
+        ("探针全挂按网络问题处理", test_all_probes_failed_is_network_problem),
         ("软 404 目录从结果撤回", test_soft404_dir_withdraws_its_results),
         ("空文件名路径不存在", test_no_empty_stem_paths),
         ("--ir 作用于探针", test_ir_applies_to_probes),

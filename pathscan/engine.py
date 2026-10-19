@@ -117,7 +117,9 @@ class Worker(threading.Thread):
                 state.add_error(task, url, resp.error)
                 self.engine.report_error(task, url, resp.error)
                 # 探测任务失败也必须结算，否则该目录的延迟组永远等不到放行
-                self.engine.settle_failed_probe(task)
+                if self.is_probe(task):
+                    state.note_probe_failure(task.parent)
+                self.engine.settle_failed_probe(task, resp.error)
             else:
                 state.enqueue([task])
             return
@@ -148,6 +150,7 @@ class Worker(threading.Thread):
                 engine.on_suffix_result(task, url, resp)
             # 根目录探测结算完就可以登记 --od 目录了
             engine.maybe_open_ok_dirs()
+            engine.report_notices()
             return
 
         # ---- 忽略规则：判定为 404，与普通 404 完全一致 ----
@@ -282,6 +285,11 @@ class Engine(object):
         self._ok_dirs_done = True
 
     # ------------------------------------------------------------------
+    def report_notices(self):
+        """打印结算期间攒下的一次性提示（如「整批探针全挂」）。"""
+        for line in self.state.pop_notices():
+            self.printer.info(line, tag="!")
+
     def debug(self, msg):
         if self.debug_on:
             self.printer.raw("  · %s" % msg)
@@ -742,25 +750,35 @@ class Engine(object):
                        % (task.parent and task.parent + "/", suffix))
         state.note_verdict(task.parent, "ext", suffix, usable)
 
-    def settle_failed_probe(self, task):
-        """探测任务重试超限后，按「结论未知」结算，放行该目录的任务。
+    def settle_failed_probe(self, task, reason=""):
+        """探测任务重试超限后结算，放行该目录的任务。
 
-        网络不通时硬推断服务器行为很危险：如果因为网络问题就把整个目录判死，
-        扫描会静默漏掉大量结果。这里只负责把延迟组解开，让常规扫描照常进行；
-        目录是否存活仍由 task.parent 的 dead_dirs 判断。
+        目录探测失败时按「未命中」处理：网络不通不能硬推断服务器行为，
+        把整个目录判死会静默漏掉大量结果。目录是否存活仍由 task.parent
+        的 dead_dirs 判断。
+
+        后缀探测失败则相反，判为**不可信**：WAF 对 .log / .env 这类后缀
+        常常直接断连而不是回 403，探针被断连就是「这个后缀发不得」的信号。
+        判不可信后该后缀整轮跳过，备份名不会一遍遍撞墙；结论也会沿目录树
+        复用，所以一次失败不会在每个子目录重演。
         """
         if task.from_ == "dircheck":
             self.state.note_verdict(task.parent, "dead", value=False)
             self.debug("dircheck failed %s, treated as not hit"
                        % (task.parent or "/"))
         elif task.from_ == "suffixcheck":
-            # 探测失败时保守放行：少扫的风险大于多扫
             suffix = suffix_of(task.name)
             if suffix is not None:
-                self.state.note_verdict(task.parent, "ext", suffix, True)
+                self.printer.info("suffix %s under %s: probe failed (%s)"
+                                  % (suffix, task.parent or "/",
+                                     reason or "no response"), tag="!")
+                # 标成「失败得出的结论」：整批探针全挂时会撤销它
+                self.state.mark_ext_failed(task.parent, suffix)
+                self.state.note_verdict(task.parent, "ext", suffix, False)
         # 这条路径不走 handle 的 is_probe 分支，得自己检查 --od 能否登记，
         # 否则根目录探测失败时 --od 目录永远不打开，整棵子树静默漏扫。
         self.maybe_open_ok_dirs()
+        self.report_notices()
 
     # ------------------------------------------------------------------
     # 递归
