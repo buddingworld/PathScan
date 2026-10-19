@@ -666,9 +666,10 @@ class GlobalState(object):
         for key in keys:
             tasks = groups.pop(key)
             for task in tasks:
-                # 该目录下这个后缀被判定为不可用。
+                # 该目录下这个后缀被判定为不可用。common 与 backup 两组都过，
+                # 备份任务的后缀（.zip/.log/...）同样经过后缀探测。
                 # 后缀统一取最后一个点之后的部分（.tar.gz 视为 .gz）。
-                if key == "common" and task.type == "file":
+                if task.type == "file":
                     suffix = suffix_of(task.name)
                     if suffix is not None and ext_ok.get(suffix) is False:
                         continue

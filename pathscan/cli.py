@@ -68,8 +68,9 @@ Options and examples
 --files  file wordlist that already carries suffixes (no -s needed)
        --files f_ext.txt
 
--s  file suffixes, comma separated. Also used for suffix probing: the whole
-    directory skips a suffix once it is proven untrustworthy
+-s  file suffixes, comma separated. Also probed per directory, together with
+    the --files suffixes and the backup suffixes: once a suffix is proven
+    untrustworthy (catch-all 200, WAF 403) the whole directory skips it
        -s .php,.aspx,.jsp
 
 --file-pre  prefix file names, expanded together with -s
@@ -208,7 +209,8 @@ def build_parser():
                    help="file wordlist that already carries suffixes")
     g.add_argument("-s", "--suffix", metavar="LIST",
                    help="file suffixes, comma separated, e.g. .php,.aspx. "
-                        "Also drives suffix probing")
+                        "Also probed per directory (together with the "
+                        "--files suffixes and the backup suffixes)")
     g.add_argument("--file-pre", dest="file_pre", metavar="LIST",
                    help="file name prefixes, comma separated, e.g. old_,new_")
 

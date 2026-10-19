@@ -92,8 +92,10 @@ class Worker(threading.Thread):
             if self.is_probe(task):
                 engine.settle_failed_probe(task)
             return
-        # 该目录下这个后缀被判定为不可用
-        if task.type == "file" and args.suffixes:
+        # 该目录下这个后缀被判定为不可用。备份任务也是文件任务，走同一道闸门：
+        # .log 被 WAF 拦下时，后缀探测会把它标成不可信，这里就会跳过 db.log、
+        # web.log 这些备份请求，而不是一遍遍撞墙。
+        if task.type == "file":
             suf = suffix_of(task.name)
             if suf is not None and not state.ext_usable(task.parent, suf):
                 return
@@ -274,6 +276,7 @@ class Engine(object):
         self.files_ext_entries = []
         self.debug_on = False
         self._dir_entry_by_name = {}
+        self._probe_suffixes = None
         # --od 的延迟登记状态（见 start / maybe_open_ok_dirs）
         self._ok_dirs_pending = []
         self._ok_dirs_done = True
@@ -610,19 +613,18 @@ class Engine(object):
         # 注意必须在 register_probes 之前收集，否则 note_verdict 会先把
         # probe_wait 减到负数，再被 register_probes 加回来，永远差几。
         cached_verdicts = []
-        if args.suffixes:
+        pending_suffixes = []
+        for suffix in self.probe_suffixes:
             # 每个后缀各探一次。祖先目录已探明的后缀可以跳过——
             # 同一个站点后缀可用性几乎不会随目录变化。
-            pending_suffixes = []
-            for suffix in args.suffixes:
-                cached = state.lookup_ext_cache(dirpath, suffix)
-                if cached is None:
-                    pending_suffixes.append(suffix)
-                else:
-                    cached_verdicts.append(("ext", suffix, cached))
-            if pending_suffixes:
-                probe_tasks.extend(
-                    probes.make_suffix_probe_tasks(dirpath, pending_suffixes))
+            cached = state.lookup_ext_cache(dirpath, suffix)
+            if cached is None:
+                pending_suffixes.append(suffix)
+            else:
+                cached_verdicts.append(("ext", suffix, cached))
+        if pending_suffixes:
+            probe_tasks.extend(
+                probes.make_suffix_probe_tasks(dirpath, pending_suffixes))
 
         # 注册「还要等几个探测结论」：入队数 + 走缓存直接结算的那几个。
         # 用实际入队数而不是构造数，避免被 --br / 去重拦下的探针永远等不到。
@@ -641,6 +643,38 @@ class Engine(object):
             return urlsplit(self.args.url).hostname or self.args.url
         except Exception:
             return self.args.url
+
+    @property
+    def probe_suffixes(self):
+        """本轮要逐个探测的后缀（按出现顺序去重，只算一次）。
+
+        三类来源缺一不可：
+        * ``-s`` 列出的后缀 —— 常规文件任务会按它们展开；
+        * ``--files`` 词表里出现的后缀 —— 那些名字自带后缀，不经过 -s；
+        * 备份文件后缀（``db.zip`` / ``web.log`` …）—— 备份任务同样是
+          文件任务，走同一套「这个后缀在这台服务器上可不可信」的判断。
+          只探 -s 的后缀，会让 .log 这类备份后缀整轮都没被验证过：
+          被 WAF 拦下的请求会一遍遍重复发。
+
+        祖先目录已探明的后缀会走缓存，不会重复探（同一站点后缀可用性
+        几乎不随目录变化）。
+        """
+        if self._probe_suffixes is None:
+            out = []
+            for suffix in self.args.suffixes:
+                if suffix not in out:
+                    out.append(suffix)
+            for entry in self.files_ext_entries:
+                suffix = suffix_of(entry.get("name", ""))
+                if suffix is not None and suffix not in out:
+                    out.append(suffix)
+            # --nb 不生成任何备份任务，备份后缀也就不必探
+            if not self.args.nb:
+                for suffix in probes.BACKUP_SUFFIXES:
+                    if suffix not in out:
+                        out.append(suffix)
+            self._probe_suffixes = out
+        return self._probe_suffixes
 
     # ------------------------------------------------------------------
     # 探测结果处理
@@ -686,7 +720,13 @@ class Engine(object):
             self.debug("dircheck passed %s -> %s" % (parent or "/", resp.code))
 
     def on_suffix_result(self, task, url, resp):
-        """后缀探测命中 => 该后缀在该目录下不可信，之后不再扫。"""
+        """后缀探测命中 => 该后缀在该目录下不可信，之后不再扫。
+
+        命中不限于 200：随机名 + 该后缀只要没被当成「不存在」（404 类），
+        就说明这个后缀的响应不可信——可能是万能 200，也可能是 WAF 对
+        这类后缀一律 403。两种情况的处理一样：该后缀整轮跳过，别再拿
+        备份名一遍遍去撞。
+        """
         state = self.state
         suffix = suffix_of(task.name)
         if suffix is None:
@@ -694,8 +734,9 @@ class Engine(object):
             return
         usable = not resp.exists
         if resp.exists:
-            self.printer.info("suffix %s looks allowed under %s, skipping it"
-                              % (suffix, task.parent or "/"), tag="!")
+            self.printer.info("suffix %s under %s is untrustworthy (code:%s), "
+                              "skipping it"
+                              % (suffix, task.parent or "/", resp.code), tag="!")
         else:
             self.debug("suffix probe passed %s%s"
                        % (task.parent and task.parent + "/", suffix))

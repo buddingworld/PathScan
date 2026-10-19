@@ -231,6 +231,63 @@ def _has_empty_stem(path):
     return False
 
 
+def test_backup_suffix_goes_through_suffix_detection():
+    """备份文件的后缀同样过后缀检测：.log 被拦就不再发 db.log / web.log。
+
+    现场形态：WAF 对随机名 + .log 一律回 403（其它后缀正常 404）。
+    后缀检测应当据此把 .log 标成不可信，于是这一轮里所有 .log 的备份
+    请求都不再发出——而不是一遍遍撞墙。
+    """
+    counter = []
+
+    class WafLog(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _handle(self):
+            path = self.path.split("?")[0]
+            counter.append(path)
+            if path.endswith(".log"):
+                return self._send(403, b"blocked")      # WAF 拦 .log
+            if path.rstrip("/") == "" or path == "/":
+                return self._send(200, b"root")
+            return self._send(404, b"nf")
+
+        do_GET = _handle
+        do_HEAD = _handle
+        do_POST = _handle
+
+    srv, url = start_server(WafLog)
+    try:
+        res, err, st, out = run_scan(
+            url, ["admin"], ["index"],
+            extra=["-t", "3", "-r", "1", "--timeout", "5"])
+    finally:
+        srv.shutdown()
+
+    text = "\n".join(out)
+    paths = [p.split("?")[0] for p in counter]
+    probes = [p for p in paths if p.endswith(".log")]
+    print("  .log 请求:", probes, "共", len(probes))
+    # 后缀检测确实把 .log 标成不可信
+    assert "suffix .log under / is untrustworthy (code:403)" in text, text
+    # 探针只发一次；之后的备份 .log（db.log / admin.log ...）一条都不发
+    assert len(probes) == 1, "只该发那一次后缀探针: %s" % probes
+    assert "/db.log" not in paths and "/admin.log" not in paths, paths
+    # 其它后缀的备份照常扫（对照）
+    assert [p for p in paths if p.endswith(".zip")], paths[:20]
+    print("  test_backup_suffix_goes_through_suffix_detection OK")
+
+
 def test_dead_dir_skips_its_probes():
     """软 404 目录判定后，其下的后缀/备份探针不再发出。
 
@@ -826,6 +883,7 @@ def main():
         ("正常站点", test_normal_site),
         ("软 404 终止", test_soft404_root_aborts),
         ("软 404 目录下不再探测", test_dead_dir_skips_its_probes),
+        ("备份后缀过后缀检测", test_backup_suffix_goes_through_suffix_detection),
         ("软 404 目录从结果撤回", test_soft404_dir_withdraws_its_results),
         ("空文件名路径不存在", test_no_empty_stem_paths),
         ("--ir 作用于探针", test_ir_applies_to_probes),
